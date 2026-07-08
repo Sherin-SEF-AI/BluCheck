@@ -1,0 +1,33 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development",
+      "env": {
+        "API_BASE_URL": "https://d1sc0mm026oa3r.cloudfront.net"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "env": {
+        "API_BASE_URL": "https://d1sc0mm026oa3r.cloudfront.net"
+      }
+    },
+    "production": {
+      "channel": "production",
+      "autoIncrement": true,
+      "env": {
+        "API_BASE_URL": "https://d1sc0mm026oa3r.cloudfront.net"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

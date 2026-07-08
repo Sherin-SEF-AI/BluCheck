@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node / Expo / Next
+node_modules/
+.expo/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+tfplan
+tfplan.*
+
+# Env and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Android / iOS build artifacts (the debug keystore + google-services.json are kept so the
+# app can be built from a clean checkout; real signing keys should never be committed).
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/app/.cxx/
+mobile/android/local.properties
+mobile/ios/build/
+mobile/ios/Pods/
+*.apk
+*.aab
+release.keystore
+*.jks
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local artifacts
+scratch/
+*.log
