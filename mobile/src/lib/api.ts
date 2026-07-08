@@ -156,6 +156,19 @@ export async function listMyInspections(): Promise<{ items: InspectionSummary[] 
 export type ZoneIssueLabel = { zone_key: string; issue_key: string };
 export type FrameThumb = { id: string; seq: number; thumb_url: string; selected: boolean };
 export type CaptureThumbs = { kind: string; frames: FrameThumb[] };
+export type FlaggedFrame = {
+  zone_key: string;
+  zone_label: string;
+  issue_key: string;
+  severity: string | null;
+  description: string | null;
+  frame_id: string;
+  kind: string;
+  thumb_url: string;
+  annotated_endpoint: string;
+  bbox: number[] | null;
+  exact: boolean;
+};
 export type InspectionDetail = {
   id: string;
   status: string;
@@ -163,6 +176,7 @@ export type InspectionDetail = {
   vehicle_plate: string;
   reject_reason: string | null;
   reject_labels: ZoneIssueLabel[];
+  flagged_frames?: FlaggedFrame[];
   captures?: CaptureThumbs[];
 };
 
@@ -171,6 +185,33 @@ export async function getMyInspection(id: string): Promise<InspectionDetail> {
 }
 
 // Driver disputes an automated rejection -> re-opens for a human reviewer.
-export async function appealInspection(id: string): Promise<{ ok: boolean; status: string }> {
+export async function appealInspection(id: string): Promise<{ ok: boolean; status: string; ruling?: string; reason?: string }> {
   return request(`/inspections/${id}/appeal`, { method: "POST" });
+}
+
+// ----- Driver rewards -----
+export type RewardTier = { name: string; min_points: number };
+export type RewardEvent = { date: string; label: string; points: number };
+export type Rewards = {
+  points: number;
+  tier: string;
+  next_tier_at: number | null;
+  streak_days: number;
+  approved_count: number;
+  first_pass_count: number;
+  total_inspections: number;
+  this_month_points: number;
+  tiers: RewardTier[];
+  recent: RewardEvent[];
+  per_approved: number;
+  per_first_pass: number;
+  per_streak_day: number;
+};
+export async function getMyRewards(): Promise<Rewards> {
+  return request("/rewards/me");
+}
+
+export type Coaching = { headline: string; tip: string; focus_zone: string };
+export async function getMyCoaching(): Promise<Coaching> {
+  return request("/rewards/coaching");
 }

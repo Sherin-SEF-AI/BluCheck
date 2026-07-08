@@ -1,13 +1,27 @@
 import { useCallback, useEffect, useState } from "react";
 import { View, Text, FlatList, StyleSheet, ActivityIndicator, Pressable, RefreshControl, Alert, Image, ScrollView } from "react-native";
 import { router } from "expo-router";
-import { listMyInspections, getMyInspection, appealInspection, type InspectionSummary, type ZoneIssueLabel } from "@/lib/api";
+import { listMyInspections, getMyInspection, appealInspection, type InspectionSummary, type ZoneIssueLabel, type FlaggedFrame } from "@/lib/api";
 import { colors, statusColor } from "@/lib/theme";
 
-type RejectInfo = { reason: string | null; vehicleId: string; plate: string; labels: ZoneIssueLabel[]; photos: string[] };
+type RejectInfo = { reason: string | null; vehicleId: string; plate: string; labels: ZoneIssueLabel[]; flagged: FlaggedFrame[] };
 
 function pretty(key: string): string {
   return key.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase());
+}
+
+// Which capture group a flagged zone belongs to. A re-clean only re-films the flagged groups.
+const INTERIOR_ZONES = new Set(["seats", "floor_mats", "dashboard_console"]);
+function recleanTargets(labels: ZoneIssueLabel[]): { groups: string; zones: string } {
+  const groups = new Set<string>();
+  const zoneKeys = new Set<string>();
+  for (const l of labels) {
+    zoneKeys.add(l.zone_key);
+    groups.add(INTERIOR_ZONES.has(l.zone_key) ? "interior" : "exterior");
+  }
+  // No labels -> fall back to a full re-clean so nothing is skipped.
+  const g = groups.size ? Array.from(groups) : ["exterior", "interior"];
+  return { groups: g.join(","), zones: Array.from(zoneKeys).map(pretty).join(", ") };
 }
 
 export default function History() {
@@ -28,8 +42,7 @@ export default function History() {
         rejected.map(async (i) => {
           try {
             const d = await getMyInspection(i.id);
-            const photos = (d.captures ?? []).flatMap((c) => c.frames.filter((f) => f.selected).map((f) => f.thumb_url)).slice(0, 6);
-            info[i.id] = { reason: d.reject_reason, vehicleId: d.vehicle_id, plate: d.vehicle_plate, labels: d.reject_labels ?? [], photos };
+            info[i.id] = { reason: d.reject_reason, vehicleId: d.vehicle_id, plate: d.vehicle_plate, labels: d.reject_labels ?? [], flagged: d.flagged_frames ?? [] };
           } catch { /* ignore */ }
         })
       );
@@ -43,12 +56,22 @@ export default function History() {
   useEffect(() => { load(); }, [load]);
 
   function onAppeal(id: string) {
-    Alert.alert("Disagree with this result?", "A person will re-review your inspection. Only do this if you believe the automated rejection was wrong.", [
+    Alert.alert("Disagree with this result?", "Your inspection will be re-reviewed right away. Only do this if you believe the rejection was wrong.", [
       { text: "Cancel", style: "cancel" },
       {
-        text: "Send for review", onPress: async () => {
+        text: "Request re-review", onPress: async () => {
           setAppealing(id);
-          try { await appealInspection(id); Alert.alert("Sent", "A reviewer will take another look. You'll be notified of the outcome."); await load(); }
+          try {
+            const res = await appealInspection(id);
+            if (res.status === "approved") {
+              Alert.alert("Appeal accepted", "Re-reviewed and accepted — your inspection now passes.");
+            } else if (res.status === "rejected") {
+              Alert.alert("Rejection stands", res.reason || "Re-reviewed, but the rejection was upheld.");
+            } else {
+              Alert.alert("Sent for review", "A reviewer will take another look. You'll be notified of the outcome.");
+            }
+            await load();
+          }
           catch (e) { Alert.alert("Could not submit", e instanceof Error ? e.message : "Try again"); }
           finally { setAppealing(null); }
         },
@@ -98,12 +121,18 @@ export default function History() {
                   ) : rej?.reason ? (
                     <Text style={styles.reject}>{rej.reason}</Text>
                   ) : null}
-                  {rej && rej.photos.length > 0 ? (
+                  {rej && rej.flagged.length > 0 ? (
                     <>
-                      <Text style={styles.photoLabel}>Inspection photos — clean the areas above:</Text>
+                      <Text style={styles.photoLabel}>Exactly what to clean:</Text>
                       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.photoRow}>
-                        {rej.photos.map((url, idx) => (
-                          <Image key={idx} source={{ uri: url }} style={styles.photo} />
+                        {rej.flagged.map((f, idx) => (
+                          <View key={idx} style={styles.flaggedCard}>
+                            <Image source={{ uri: f.thumb_url }} style={styles.photo} />
+                            <Text style={styles.flaggedZone} numberOfLines={1}>{f.zone_label}</Text>
+                            <Text style={styles.flaggedIssue} numberOfLines={1}>
+                              {f.severity ? `${pretty(f.severity)} ` : ""}{f.issue_key ? pretty(f.issue_key) : "issue"}
+                            </Text>
+                          </View>
                         ))}
                       </ScrollView>
                     </>
@@ -111,14 +140,17 @@ export default function History() {
                   {rej ? (
                     <Pressable
                       style={styles.reinspect}
-                      onPress={() =>
+                      onPress={() => {
+                        const t = recleanTargets(rej.labels);
                         router.push({
                           pathname: "/capture",
-                          params: { vehicleId: rej.vehicleId, plate: rej.plate, reinspectionOf: item.id },
-                        })
-                      }
+                          params: { vehicleId: rej.vehicleId, plate: rej.plate, reinspectionOf: item.id, groups: t.groups, zones: t.zones },
+                        });
+                      }}
                     >
-                      <Text style={styles.reinspectText}>Re-clean &amp; re-inspect</Text>
+                      <Text style={styles.reinspectText}>
+                        Re-clean {recleanTargets(rej.labels).groups.split(",").length < 2 ? `(${recleanTargets(rej.labels).groups} only)` : "& re-inspect"}
+                      </Text>
                     </Pressable>
                   ) : null}
                   <Pressable style={styles.appeal} disabled={appealing === item.id} onPress={() => onAppeal(item.id)}>
@@ -148,7 +180,10 @@ const styles = StyleSheet.create({
   checkItem: { color: colors.text, fontSize: 13, fontFamily: colors.mono },
   photoLabel: { color: colors.textDim, fontSize: 12, marginTop: 10 },
   photoRow: { marginTop: 6 },
-  photo: { width: 96, height: 64, borderRadius: 6, marginRight: 6, backgroundColor: colors.surfaceRaised },
+  photo: { width: 110, height: 74, borderRadius: 6, backgroundColor: colors.surfaceRaised },
+  flaggedCard: { marginRight: 8, width: 110 },
+  flaggedZone: { color: colors.text, fontSize: 12, fontWeight: "700", marginTop: 4 },
+  flaggedIssue: { color: colors.danger, fontSize: 11, marginTop: 1 },
   reinspect: { marginTop: 10, backgroundColor: colors.accent, borderRadius: 6, padding: 12, alignItems: "center" },
   reinspectText: { color: "#ffffff", fontWeight: "700" },
   appeal: { marginTop: 8, borderColor: colors.border, borderWidth: 1, borderRadius: 6, padding: 10, alignItems: "center" },

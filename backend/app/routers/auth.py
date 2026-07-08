@@ -10,7 +10,7 @@ import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -177,7 +177,17 @@ def pin_login(body: PinLoginRequest, db: Session = Depends(get_db)) -> LoginResp
 def save_push_token(
     body: PushTokenRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
-    user.push_token = body.push_token
+    token = body.push_token
+    # An FCM token identifies a DEVICE, not a person. If several drivers signed in on the same
+    # phone, the token would otherwise stay attached to every one of those accounts and a push for
+    # one driver's inspection would hit that phone no matter whose it was. Enforce that a token
+    # belongs to exactly ONE account -- the most recent to register it -- by clearing it from any
+    # other user first.
+    if token:
+        db.execute(
+            update(User).where(User.push_token == token, User.id != user.id).values(push_token=None)
+        )
+    user.push_token = token
     db.commit()
     return {"ok": True}
 

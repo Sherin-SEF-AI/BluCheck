@@ -4,8 +4,12 @@ import Nav from "@/components/Nav";
 import {
   getModelVersion, getPerformance, setMode, setThresholds,
   getScoringConfig, patchScoringConfig, buildCalibration, validateModel, recommendThresholds,
+  generateSop, applySop,
+  listPolicies, savePolicy, updatePolicy, deletePolicy, activatePolicy,
+  getTuningSuggestion,
   type ModelPerformance, type ModelVersion, type ScoringConfig, type Calibration,
-  type ValidationReport, type RecommendResult,
+  type ValidationReport, type RecommendResult, type SopProposal,
+  type Policy, type RecommendedSop, type TuningSuggestion,
 } from "@/lib/api";
 
 const MODES: { key: "shadow" | "assist" | "auto" | "disabled"; label: string; hint: string }[] = [
@@ -31,6 +35,15 @@ export default function ModelPage() {
   const [maxFa, setMaxFa] = useState(0.05);
   const [fullAuto, setFullAuto] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [sopText, setSopText] = useState("");
+  const [proposal, setProposal] = useState<SopProposal | null>(null);
+  const [activeSop, setActiveSop] = useState<string | null>(null);
+  const [policies, setPolicies] = useState<Policy[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [recommended, setRecommended] = useState<RecommendedSop[]>([]);
+  const [policyName, setPolicyName] = useState("");
+  const [tuning, setTuning] = useState<TuningSuggestion | null>(null);
+  const [tuningBusy, setTuningBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -43,8 +56,97 @@ export default function ModelPage() {
       setBlend(Number(sc.effective.blend_mean_weight));
       setMaxImg(Number(sc.effective.max_images_per_call));
       setFullAuto(Boolean((v.thresholds as { full_autonomy?: boolean } | null)?.full_autonomy));
+      setActiveSop((sc.stored as { _sop?: string } | null)?._sop ?? null);
+      const pl = await listPolicies();
+      setPolicies(pl.policies); setActiveId(pl.active_id); setRecommended(pl.recommended);
     } catch (e) { setErr(e instanceof Error ? e.message : "Failed to load"); }
   }, []);
+
+  async function doGenerateSop() {
+    if (sopText.trim().length < 4) return;
+    setBusy(true); setErr(null); setNote(null); setProposal(null);
+    try { setProposal(await generateSop(sopText)); }
+    catch (e) { setErr(e instanceof Error ? e.message : "Could not generate SOP"); } finally { setBusy(false); }
+  }
+  async function doApplySop() {
+    if (!proposal) return;
+    if (!window.confirm("Apply this policy now WITHOUT saving it to your library? It becomes the live cleanliness criteria. To keep it for later, give it a name and use Save instead.")) return;
+    setBusy(true); setErr(null); setNote(null);
+    try {
+      await applySop(sopText, proposal.scoring_config, proposal.thresholds as Record<string, unknown>);
+      setNote("Policy applied — live for new inspections (not saved to the library).");
+      setProposal(null);
+      await load();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Failed to apply"); } finally { setBusy(false); }
+  }
+  async function doAnalyzeTuning() {
+    setTuningBusy(true); setErr(null); setNote(null); setTuning(null);
+    try { setTuning(await getTuningSuggestion(30)); }
+    catch (e) { setErr(e instanceof Error ? e.message : "Could not analyze overrides"); } finally { setTuningBusy(false); }
+  }
+  async function doApplyTuning() {
+    if (!tuning || tuning.no_change || !tuning.scoring_config) return;
+    if (!window.confirm("Apply this self-tuning adjustment? It updates the live zone weights, severity caps and thresholds based on where humans overturned the agent.")) return;
+    setBusy(true); setErr(null); setNote(null);
+    try {
+      await applySop(tuning.summary || "Auto-tuned from human overrides", tuning.scoring_config, (tuning.thresholds ?? {}) as Record<string, unknown>);
+      setNote("Self-tuning applied — live for new inspections.");
+      setTuning(null);
+      await load();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Failed to apply"); } finally { setBusy(false); }
+  }
+
+  async function doSavePolicy(activate: boolean) {
+    if (!proposal) return;
+    const name = policyName.trim() || (sopText.trim().slice(0, 40) || "Untitled policy");
+    setBusy(true); setErr(null); setNote(null);
+    try {
+      const res = await savePolicy({
+        name, sop: sopText, scoring_config: proposal.scoring_config,
+        thresholds: proposal.thresholds as Record<string, unknown>, summary: proposal.summary, activate,
+      });
+      setPolicies(res.policies); setActiveId(res.active_id);
+      setNote(activate ? `Policy “${name}” saved and made active — live for new inspections.` : `Policy “${name}” saved to your library.`);
+      setProposal(null); setPolicyName("");
+      if (activate) await load();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Failed to save"); } finally { setBusy(false); }
+  }
+  async function doActivatePolicy(p: Policy) {
+    if (!window.confirm(`Make “${p.name}” the live cleanliness policy? It replaces the current scoring criteria for new inspections.`)) return;
+    setBusy(true); setErr(null); setNote(null);
+    try {
+      const res = await activatePolicy(p.id);
+      setPolicies(res.policies); setActiveId(res.active_id);
+      setNote(`“${p.name}” is now the active policy.`);
+      await load();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Failed to activate"); } finally { setBusy(false); }
+  }
+  async function doDeletePolicy(p: Policy) {
+    if (!window.confirm(`Delete policy “${p.name}”? This cannot be undone.${p.active ? "\n\nThis is the ACTIVE policy; the live scoring config stays as-is but no policy will be marked active." : ""}`)) return;
+    setBusy(true); setErr(null); setNote(null);
+    try {
+      const res = await deletePolicy(p.id);
+      setPolicies(res.policies); setActiveId(res.active_id);
+      setNote(`Policy “${p.name}” deleted.`);
+    } catch (e) { setErr(e instanceof Error ? e.message : "Failed to delete"); } finally { setBusy(false); }
+  }
+  async function doRenamePolicy(p: Policy) {
+    const name = window.prompt("Rename policy", p.name);
+    if (!name || name.trim() === p.name) return;
+    setBusy(true); setErr(null); setNote(null);
+    try {
+      const res = await updatePolicy(p.id, { name: name.trim() });
+      setPolicies(res.policies); setActiveId(res.active_id);
+    } catch (e) { setErr(e instanceof Error ? e.message : "Failed to rename"); } finally { setBusy(false); }
+  }
+  function editPolicyText(p: Policy) {
+    setSopText(p.sop); setPolicyName(p.name); setProposal(null); setNote(`Loaded “${p.name}”. Edit the text, Generate policy, then Save to update or add a new one.`);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+  function useTemplate(sop: string) {
+    setSopText(sop); setProposal(null); setPolicyName("");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
 
   async function toggleFullAuto() {
     const next = !fullAuto;
@@ -111,7 +213,146 @@ export default function ModelPage() {
               {perf.model_name ?? mv.vlm_model} · prompt {mv.prompt_version} · current mode <span className={`badge ${mv.mode === "disabled" ? "rejected" : mv.mode === "auto" ? "approved" : "pending"}`}>{mv.mode}</span>
             </div>
 
-            <div className="section-title" style={{ marginTop: 0 }}>MODE</div>
+            <div className="section-title" style={{ marginTop: 0 }}>CLEANLINESS SOP · describe your policy, the agent configures scoring</div>
+            <div className="card">
+              {activeSop ? <div className="review-hint" style={{ marginTop: 0, marginBottom: 10 }}>Active policy: <span style={{ color: "var(--text)" }}>&ldquo;{activeSop}&rdquo;</span></div> : null}
+              <textarea
+                value={sopText}
+                onChange={(e) => setSopText(e.target.value)}
+                rows={3}
+                placeholder="e.g. Prioritise the interior passenger area (seats, floor, dashboard). Small dirt on the exterior is fine, but flag big exterior dirt. Be lenient on the boot."
+                style={{ width: "100%", resize: "vertical", fontFamily: "inherit" }}
+              />
+              <div className="filters" style={{ marginTop: 10, marginBottom: 0 }}>
+                <button disabled={busy || sopText.trim().length < 4} onClick={doGenerateSop}>
+                  {busy && !proposal ? "Generating…" : "Generate policy"}
+                </button>
+                <span className="review-hint" style={{ marginTop: 0 }}>An agent turns plain English into per-zone weights, severity caps and thresholds. Review before applying.</span>
+              </div>
+
+              {proposal ? (
+                <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 14 }}>
+                  <div style={{ color: "var(--text)", fontSize: 13, lineHeight: 1.55, marginBottom: 10 }}>{proposal.summary}</div>
+                  <div className="review-hint" style={{ marginTop: 0, marginBottom: 6 }}>PROPOSED ZONE PRIORITY (higher = matters more)</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 12, maxWidth: 460 }}>
+                    {Object.entries((proposal.scoring_config.zone_weight ?? {}) as Record<string, number>)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([z, w]) => (
+                        <div key={z} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span className="mono dim" style={{ width: 140, fontSize: 12 }}>{z}</span>
+                          <div style={{ flex: 1, height: 8, background: "var(--surface-raised)", borderRadius: 4, overflow: "hidden" }}>
+                            <div style={{ width: `${Math.min(100, (w / 2) * 100)}%`, height: "100%", background: "var(--accent)" }} />
+                          </div>
+                          <span className="mono" style={{ width: 34, textAlign: "right", fontSize: 12 }}>{w.toFixed(1)}</span>
+                        </div>
+                      ))}
+                  </div>
+                  <div className="mono dim" style={{ fontSize: 12, marginBottom: 12 }}>
+                    severity caps — minor ≤{(proposal.scoring_config.severity_cap as Record<string, number>)?.minor}, moderate ≤{(proposal.scoring_config.severity_cap as Record<string, number>)?.moderate}, severe ≤{(proposal.scoring_config.severity_cap as Record<string, number>)?.severe}
+                    {" · "}mean/worst blend {String(proposal.scoring_config.blend_mean_weight)}
+                    {" · "}auto-approve ≥{proposal.thresholds.overall?.auto_approve}, auto-reject ≤{proposal.thresholds.overall?.auto_reject}
+                  </div>
+                  <div className="filters" style={{ marginBottom: 8, alignItems: "center" }}>
+                    <input
+                      value={policyName}
+                      onChange={(e) => setPolicyName(e.target.value)}
+                      placeholder="Policy name (e.g. Passenger-first)"
+                      style={{ minWidth: 240, fontFamily: "inherit" }}
+                    />
+                    <button disabled={busy} onClick={() => doSavePolicy(true)}>Save & activate</button>
+                    <button className="ghost" disabled={busy} onClick={() => doSavePolicy(false)}>Save to library</button>
+                  </div>
+                  <div className="filters" style={{ marginBottom: 0 }}>
+                    <button className="ghost" disabled={busy} onClick={doApplySop}>Apply once (don&rsquo;t save)</button>
+                    <button className="ghost" disabled={busy} onClick={() => setProposal(null)}>Discard</button>
+                    <span className="review-hint" style={{ marginTop: 0 }}>Save keeps it in your library to reuse, edit or switch back to. Fine-tune exact numbers below.</span>
+                  </div>
+                </div>
+              ) : null}
+
+              {recommended.length ? (
+                <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+                  <div className="review-hint" style={{ marginTop: 0, marginBottom: 8 }}>RECOMMENDED STARTERS · click to load, then Generate</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {recommended.map((r) => (
+                      <button key={r.title} className="ghost" disabled={busy} onClick={() => useTemplate(r.sop)}
+                        title={r.sop} style={{ fontSize: 12 }}>{r.title}</button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="section-title">SAVED POLICIES {activeId ? "" : "· none active"}</div>
+            <div className="card">
+              {policies.length === 0 ? (
+                <div className="review-hint" style={{ marginTop: 0 }}>No saved policies yet. Generate one above and Save it to build your library.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {policies.map((p) => (
+                    <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 6, border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", background: p.active ? "var(--surface-raised)" : "transparent" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                        <span style={{ color: "var(--text)", fontWeight: 600 }}>{p.name}</span>
+                        {p.active ? <span className="badge approved">ACTIVE</span> : null}
+                        {p.thresholds.overall ? <span className="mono dim" style={{ fontSize: 11 }}>approve ≥{p.thresholds.overall.auto_approve} · reject ≤{p.thresholds.overall.auto_reject}</span> : null}
+                        <div style={{ flex: 1 }} />
+                        {!p.active ? <button disabled={busy} onClick={() => doActivatePolicy(p)} style={{ fontSize: 12 }}>Activate</button> : null}
+                        <button className="ghost" disabled={busy} onClick={() => editPolicyText(p)} style={{ fontSize: 12 }}>Edit</button>
+                        <button className="ghost" disabled={busy} onClick={() => doRenamePolicy(p)} style={{ fontSize: 12 }}>Rename</button>
+                        <button className="ghost" disabled={busy} onClick={() => doDeletePolicy(p)} style={{ fontSize: 12, color: "var(--danger, #d66)" }}>Delete</button>
+                      </div>
+                      {p.summary ? <div className="dim" style={{ fontSize: 12, lineHeight: 1.5 }}>{p.summary}</div> : <div className="dim" style={{ fontSize: 12, fontStyle: "italic" }}>{p.sop.slice(0, 160)}{p.sop.length > 160 ? "…" : ""}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="section-title">SELF-TUNING · learn from human overrides</div>
+            <div className="card">
+              <div className="filters" style={{ marginTop: 0, marginBottom: tuning ? 12 : 0 }}>
+                <button disabled={tuningBusy} onClick={doAnalyzeTuning}>{tuningBusy ? "Analyzing…" : "Analyze overrides"}</button>
+                <span className="review-hint" style={{ marginTop: 0 }}>An agent reviews the last 30 days of cases where a human overturned the agent and proposes a modest policy adjustment. Review before applying.</span>
+              </div>
+              {tuning ? (
+                <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+                  <div className="mono dim" style={{ fontSize: 12, marginBottom: 8 }}>
+                    {tuning.evidence.overrides} override(s) · {tuning.evidence.too_strict} too-strict (agent rejected, human approved) · {tuning.evidence.too_lenient} too-lenient
+                    {" · "}confidence {(tuning.confidence * 100).toFixed(0)}%
+                  </div>
+                  <div style={{ color: "var(--text)", fontSize: 13, lineHeight: 1.55, marginBottom: 10 }}>{tuning.summary}</div>
+                  {tuning.no_change || !tuning.scoring_config ? (
+                    <div className="review-hint" style={{ marginTop: 0 }}>No change recommended.</div>
+                  ) : (
+                    <>
+                      <div className="review-hint" style={{ marginTop: 0, marginBottom: 6 }}>PROPOSED ZONE PRIORITY</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 12, maxWidth: 460 }}>
+                        {Object.entries((tuning.scoring_config.zone_weight ?? {}) as Record<string, number>)
+                          .sort((a, b) => b[1] - a[1])
+                          .map(([z, w]) => (
+                            <div key={z} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <span className="mono dim" style={{ width: 140, fontSize: 12 }}>{z}</span>
+                              <div style={{ flex: 1, height: 8, background: "var(--surface-raised)", borderRadius: 4, overflow: "hidden" }}>
+                                <div style={{ width: `${Math.min(100, (w / 2) * 100)}%`, height: "100%", background: "var(--accent)" }} />
+                              </div>
+                              <span className="mono" style={{ width: 34, textAlign: "right", fontSize: 12 }}>{w.toFixed(1)}</span>
+                            </div>
+                          ))}
+                      </div>
+                      <div className="mono dim" style={{ fontSize: 12, marginBottom: 12 }}>
+                        auto-approve ≥{tuning.thresholds?.overall?.auto_approve}, auto-reject ≤{tuning.thresholds?.overall?.auto_reject}
+                      </div>
+                      <div className="filters" style={{ marginBottom: 0 }}>
+                        <button disabled={busy} onClick={doApplyTuning}>Apply adjustment</button>
+                        <button className="ghost" disabled={busy} onClick={() => setTuning(null)}>Dismiss</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="section-title">MODE</div>
             <div className="stat-row">
               {MODES.map((m) => (
                 <button key={m.key} className={mv.mode === m.key ? "" : "ghost"} disabled={busy || mv.mode === m.key}

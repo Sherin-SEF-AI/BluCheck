@@ -1,12 +1,33 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Nav from "@/components/Nav";
-import { getMetrics, getTrends, type Metrics, type Trends } from "@/lib/api";
+import {
+  getMetrics, getTrends, getOverdue, getCadence, setCadence, runOverdue,
+  type Metrics, type Trends, type OverdueList,
+} from "@/lib/api";
+
+function fmtOverdue(h: number | null, never: boolean): string {
+  if (never) return "never inspected";
+  if (h === null) return "";
+  if (h < 24) return `${Math.round(h)}h overdue`;
+  return `${Math.round(h / 24)}d overdue`;
+}
 
 export default function MetricsPage() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [trends, setTrends] = useState<Trends | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [overdue, setOverdue] = useState<OverdueList | null>(null);
+  const [cadence, setCad] = useState<number | "">("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const loadOverdue = useCallback(async () => {
+    try {
+      const [o, c] = await Promise.all([getOverdue(), getCadence()]);
+      setOverdue(o); setCad(c.cadence_hours);
+    } catch { /* ignore */ }
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -18,7 +39,20 @@ export default function MetricsPage() {
         setError(e instanceof Error ? e.message : "Failed to load metrics");
       }
     })();
-  }, []);
+    loadOverdue();
+  }, [loadOverdue]);
+
+  async function saveCadence() {
+    if (typeof cadence !== "number" || cadence < 1) return;
+    setBusy(true); setNote(null);
+    try { await setCadence(cadence); await loadOverdue(); setNote("Cadence saved."); }
+    catch (e) { setError(e instanceof Error ? e.message : "Failed"); } finally { setBusy(false); }
+  }
+  async function sendReminders() {
+    setBusy(true); setNote(null);
+    try { const r = await runOverdue(); setNote(`Reminders sent: ${r.reminded} (of ${r.overdue} overdue, ${r.escalated} critical).`); }
+    catch (e) { setError(e instanceof Error ? e.message : "Failed"); } finally { setBusy(false); }
+  }
 
   return (
     <>
@@ -26,6 +60,36 @@ export default function MetricsPage() {
       <div className="container">
         <h2>Metrics</h2>
         {error ? <div className="error">{error}</div> : null}
+        {note ? <div className="banner-row agent" style={{ color: "var(--accent)" }}>{note}</div> : null}
+
+        <div className="section-title" style={{ marginTop: 0 }}>
+          OVERDUE VEHICLES {overdue ? `· ${overdue.count} past the ${overdue.cadence_hours}h cadence` : ""}
+        </div>
+        <div className="card">
+          <div className="filters" style={{ marginTop: 0, alignItems: "center" }}>
+            <span className="review-hint" style={{ marginTop: 0 }}>Inspect at least every</span>
+            <input type="number" min={1} value={cadence} onChange={(e) => setCad(e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 90 }} />
+            <span className="review-hint" style={{ marginTop: 0 }}>hours</span>
+            <button className="ghost" disabled={busy} onClick={saveCadence}>Save cadence</button>
+            <button className="ghost" disabled={busy} onClick={sendReminders} title="Also runs automatically once a day">Send reminders now</button>
+          </div>
+          {overdue && overdue.items.length > 0 ? (
+            <table style={{ marginTop: 12 }}>
+              <thead><tr><th>Vehicle</th><th>Driver</th><th>Last passed</th><th>Status</th></tr></thead>
+              <tbody>
+                {overdue.items.map((o) => (
+                  <tr key={o.driver_id}>
+                    <td className="mono">{o.plate}</td>
+                    <td>{o.name}</td>
+                    <td className="mono dim">{o.last_approved_at ? new Date(o.last_approved_at).toLocaleString("sv-SE", { timeZone: "Asia/Kolkata" }) : "—"}</td>
+                    <td><span className={`badge ${o.severity === "critical" ? "rejected" : "pending"}`}>{fmtOverdue(o.hours_overdue, o.never)}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : <div className="dim" style={{ marginTop: 10 }}>All vehicles are within the inspection cadence. 🎉</div>}
+        </div>
+
         {!metrics ? (
           <div className="dim">Loading...</div>
         ) : (

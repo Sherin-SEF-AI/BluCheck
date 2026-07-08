@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { View, Text, FlatList, Pressable, StyleSheet, ActivityIndicator } from "react-native";
 import { router } from "expo-router";
-import { listVehicles, type Vehicle, ApiError } from "@/lib/api";
+import { listVehicles, getMyRewards, type Vehicle, ApiError } from "@/lib/api";
 import { clearSession, getName } from "@/lib/auth";
 import { pendingCount } from "@/lib/uploadQueue";
 import { colors } from "@/lib/theme";
@@ -12,12 +12,15 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
+  const [points, setPoints] = useState<number | null>(null);
+  const [tier, setTier] = useState<string | null>(null);
 
   useEffect(() => {
     getName().then((n) => setName(n ?? "")).catch(() => undefined);
     const check = () => pendingCount().then(setPending).catch(() => undefined);
     check();
     const t = setInterval(check, 2000);
+    getMyRewards().then((r) => { setPoints(r.points); setTier(r.tier); }).catch(() => undefined);
     return () => clearInterval(t);
   }, []);
 
@@ -94,6 +97,14 @@ export default function Home() {
         </Pressable>
       ) : null}
 
+      <Pressable style={styles.rewardsBtn} onPress={() => router.push("/rewards")}>
+        <View>
+          <Text style={styles.rewardsLabel}>MY REWARDS</Text>
+          <Text style={styles.rewardsTier}>{tier ?? "Keep inspecting to earn"}</Text>
+        </View>
+        <Text style={styles.rewardsPoints}>{points !== null ? `${points} pts` : "→"}</Text>
+      </Pressable>
+
       <Pressable style={styles.secondary} onPress={() => router.push("/history")}>
         <Text style={styles.secondaryText}>View my inspections</Text>
       </Pressable>
@@ -124,4 +135,8 @@ const styles = StyleSheet.create({
   pendingBanner: { flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: colors.surfaceRaised, borderColor: colors.warn, borderWidth: 1, borderRadius: 6, padding: 12, marginTop: 8 },
   pendingDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.warn },
   pendingText: { color: colors.text, fontSize: 13 },
+  rewardsBtn: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", backgroundColor: colors.surface, borderColor: colors.accent, borderWidth: 1, borderRadius: 8, padding: 16, marginTop: 12 },
+  rewardsLabel: { color: colors.textDim, fontFamily: colors.mono, fontSize: 11, letterSpacing: 1 },
+  rewardsTier: { color: colors.text, fontSize: 15, fontWeight: "700", marginTop: 3 },
+  rewardsPoints: { color: colors.accent, fontSize: 18, fontWeight: "800", fontFamily: colors.mono },
 });

@@ -192,6 +192,56 @@ export function review(
   });
 }
 
+// ----- Agentic admin assistant -----
+export type AssistantMsg = { role: "user" | "assistant"; content: string };
+export type PendingAction = { tool: string; args: Record<string, unknown>; title: string; detail: string };
+export type AssistantReply = { answer: string; pending_actions: PendingAction[] };
+export type AssistantContext = { page?: string; inspection_id?: string };
+export function askAssistant(messages: AssistantMsg[], context?: AssistantContext): Promise<AssistantReply> {
+  return request("/assistant/ask", { method: "POST", body: JSON.stringify({ messages, context: context ?? null }) });
+}
+export function executeAssistantAction(tool: string, args: Record<string, unknown>): Promise<{ ok: boolean; message: string }> {
+  return request("/assistant/execute", { method: "POST", body: JSON.stringify({ tool, args }) });
+}
+
+// ----- Overdue cadence enforcement -----
+export type OverdueVehicle = {
+  driver_id: string; plate: string; name: string;
+  last_approved_at: string | null; hours_overdue: number | null; never: boolean; severity: "due" | "critical";
+};
+export type OverdueList = { cadence_hours: number; count: number; items: OverdueVehicle[] };
+export function getOverdue(): Promise<OverdueList> { return request("/metrics/overdue"); }
+export function getCadence(): Promise<{ cadence_hours: number }> { return request("/metrics/cadence"); }
+export function setCadence(cadence_hours: number): Promise<{ cadence_hours: number }> {
+  return request("/metrics/cadence", { method: "POST", body: JSON.stringify({ cadence_hours }) });
+}
+export function runOverdue(): Promise<{ overdue: number; reminded: number; escalated: number; cadence_hours: number }> {
+  return request("/metrics/run-overdue", { method: "POST" });
+}
+
+// ----- Self-tuning policy agent -----
+export type TuningEvidence = {
+  days: number; overrides: number; too_strict: number; too_lenient: number;
+  strict_zones: Record<string, number>; lenient_zones: Record<string, number>;
+};
+export type TuningSuggestion = {
+  no_change: boolean; confidence: number; summary: string;
+  scoring_config: Record<string, unknown> | null;
+  thresholds: { overall?: { auto_approve?: number; auto_reject?: number } } | null;
+  evidence: TuningEvidence;
+};
+export function getTuningSuggestion(days = 30): Promise<TuningSuggestion> {
+  return request(`/model/tuning-suggestion?days=${days}`);
+}
+
+export type RephraseResult = { reason: string; labels: ZoneIssueLabel[] };
+export function rephraseReview(text: string, context?: unknown[]): Promise<RephraseResult> {
+  return request(`/inspections/review-rephrase`, {
+    method: "POST",
+    body: JSON.stringify({ text, context: context ?? null }),
+  });
+}
+
 export type TaxonomyItem = { key: string; label: string };
 export function getZones(): Promise<TaxonomyItem[]> {
   return request("/taxonomy/zones");
@@ -300,6 +350,52 @@ export type ScoringConfig = {
 export function getScoringConfig(): Promise<ScoringConfig> { return request("/model/scoring-config"); }
 export function patchScoringConfig(scoring_config: Record<string, unknown>): Promise<ScoringConfig> {
   return request("/model/scoring-config", { method: "PATCH", body: JSON.stringify({ scoring_config }) });
+}
+
+// ----- Agentic SOP generator -----
+export type SopProposal = {
+  scoring_config: Record<string, unknown>;
+  thresholds: { overall?: { auto_approve?: number; auto_reject?: number } };
+  summary: string;
+  priorities: string[];
+};
+export function generateSop(sop: string): Promise<SopProposal> {
+  return request("/model/sop/generate", { method: "POST", body: JSON.stringify({ sop }) });
+}
+export function applySop(sop: string, scoring_config: Record<string, unknown>, thresholds: Record<string, unknown>): Promise<ScoringConfig> {
+  return request("/model/sop/apply", { method: "POST", body: JSON.stringify({ sop, scoring_config, thresholds }) });
+}
+
+// ----- Saved policy library (edit / delete / activate + recommended templates) -----
+export type Policy = {
+  id: string;
+  name: string;
+  sop: string;
+  scoring_config: Record<string, unknown>;
+  thresholds: { overall?: { auto_approve?: number; auto_reject?: number } };
+  summary: string;
+  active: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+};
+export type RecommendedSop = { title: string; sop: string };
+export type PolicyList = { policies: Policy[]; active_id: string | null; recommended: RecommendedSop[] };
+export type PolicyMutate = { policies: Policy[]; active_id: string | null };
+
+export function listPolicies(): Promise<PolicyList> {
+  return request("/model/policies");
+}
+export function savePolicy(p: { name: string; sop: string; scoring_config: Record<string, unknown>; thresholds: Record<string, unknown>; summary?: string; activate?: boolean }): Promise<PolicyMutate> {
+  return request("/model/policies", { method: "POST", body: JSON.stringify(p) });
+}
+export function updatePolicy(id: string, patch: { name?: string; sop?: string; scoring_config?: Record<string, unknown>; thresholds?: Record<string, unknown>; summary?: string }): Promise<PolicyMutate> {
+  return request(`/model/policies/${id}`, { method: "PUT", body: JSON.stringify(patch) });
+}
+export function deletePolicy(id: string): Promise<PolicyMutate> {
+  return request(`/model/policies/${id}`, { method: "DELETE" });
+}
+export function activatePolicy(id: string): Promise<PolicyMutate> {
+  return request(`/model/policies/${id}/activate`, { method: "POST" });
 }
 
 // ----- Calibration + validation harness -----

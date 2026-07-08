@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
@@ -12,18 +13,138 @@ from .. import agent, audit, push
 from ..auth import require_admin
 from ..db import get_db
 from ..models import Inspection, Review, ScoringResult, User, Vehicle
+from ..modelcfg import ensure_active_model_version
 from ..schemas import (
+    CadenceRequest,
+    CadenceResponse,
     ComplianceDriver,
     ComplianceResponse,
     MetricsSummary,
     MetricsTrends,
-    VehicleTrend,
+    OverdueResponse,
+    OverdueVehicle,
     VehicleTrendsResponse,
+    VehicleTrend,
 )
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
 
 IST = timezone(timedelta(hours=5, minutes=30))  # fleet operates in India
+DEFAULT_CADENCE_HOURS = 24  # inspect at least once a day by default
+
+
+def _cadence_hours(db: Session) -> int:
+    """The required inspection cadence in hours, stored on the active model version's config."""
+    mv = ensure_active_model_version(db)
+    try:
+        return max(1, int((mv.thresholds or {}).get("cadence_hours", DEFAULT_CADENCE_HOURS)))
+    except (TypeError, ValueError):
+        return DEFAULT_CADENCE_HOURS
+
+
+def _overdue_rows(db: Session, now: datetime | None = None) -> tuple[int, list[dict]]:
+    """Active drivers whose most recent APPROVED inspection is older than the cadence (or who have
+    never passed one). Returns (cadence_hours, rows sorted most-overdue-first)."""
+    now = now or datetime.now(timezone.utc)
+    cadence = _cadence_hours(db)
+    drivers = list(
+        db.execute(select(User).where(User.role == "driver", User.active.is_(True))).scalars()
+    )
+    # Latest APPROVED inspection per driver in one query.
+    last_appr = {
+        did: ts
+        for did, ts in db.execute(
+            select(Inspection.driver_id, Inspection.created_at)
+            .where(Inspection.status == "approved")
+            .distinct(Inspection.driver_id)
+            .order_by(Inspection.driver_id, Inspection.created_at.desc())
+        ).all()
+    }
+    rows: list[dict] = []
+    for d in drivers:
+        la = last_appr.get(d.id)
+        if la is not None and la.tzinfo is None:
+            la = la.replace(tzinfo=timezone.utc)
+        hours_since = (now - la).total_seconds() / 3600 if la else None
+        if la is None or hours_since > cadence:
+            over = (hours_since - cadence) if hours_since is not None else None
+            critical = la is None or (hours_since is not None and hours_since > 2 * cadence)
+            rows.append(
+                {
+                    "driver_id": str(d.id),
+                    "plate": d.car_number or "unknown",
+                    "name": d.name,
+                    "last_approved_at": la,
+                    "hours_overdue": round(over, 1) if over is not None else None,
+                    "never": la is None,
+                    "severity": "critical" if critical else "due",
+                }
+            )
+    rows.sort(key=lambda r: (0 if r["never"] else 1, -(r["hours_overdue"] or 0)))
+    return cadence, rows
+
+
+def overdue_sweep(db: Session) -> dict:
+    """Push a reminder to every overdue driver; a stronger message for critically overdue ones.
+    Called on a daily schedule by the API background loop. Idempotent to call repeatedly."""
+    cadence, rows = _overdue_rows(db)
+    reminded = escalated = 0
+    for r in rows:
+        driver = db.get(User, uuid.UUID(r["driver_id"]))
+        if driver is None:
+            continue
+        plate = r["plate"]
+        if r["severity"] == "critical":
+            title = "Inspection overdue"
+            msg = f"{plate} is overdue for its cleanliness inspection. Please complete it now."
+            escalated += 1
+        else:
+            title = "Inspection due"
+            msg = f"Please complete today's cleanliness inspection for {plate}."
+        if push.send_to_driver(db, driver, title, msg, {"type": "overdue_reminder"}) == push.OK:
+            reminded += 1
+    audit.record(
+        db, actor_id=None, action="overdue_sweep", entity="fleet", entity_id="all",
+        detail={"overdue": len(rows), "reminded": reminded, "escalated": escalated, "cadence_hours": cadence},
+    )
+    db.commit()
+    return {"overdue": len(rows), "reminded": reminded, "escalated": escalated, "cadence_hours": cadence}
+
+
+@router.get("/cadence", response_model=CadenceResponse)
+def get_cadence(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> CadenceResponse:
+    return CadenceResponse(cadence_hours=_cadence_hours(db))
+
+
+@router.post("/cadence", response_model=CadenceResponse)
+def set_cadence(
+    body: CadenceRequest, admin: User = Depends(require_admin), db: Session = Depends(get_db)
+) -> CadenceResponse:
+    mv = ensure_active_model_version(db)
+    mv.thresholds = {**(mv.thresholds or {}), "cadence_hours": body.cadence_hours}
+    audit.record(
+        db, actor_id=admin.id, action="set_cadence", entity="model_version",
+        entity_id=str(mv.id), detail={"cadence_hours": body.cadence_hours},
+    )
+    db.commit()
+    return CadenceResponse(cadence_hours=body.cadence_hours)
+
+
+@router.get("/overdue", response_model=OverdueResponse)
+def overdue(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> OverdueResponse:
+    """Vehicles whose driver has not passed an inspection within the cadence window."""
+    cadence, rows = _overdue_rows(db)
+    return OverdueResponse(
+        cadence_hours=cadence,
+        count=len(rows),
+        items=[OverdueVehicle(**r) for r in rows],
+    )
+
+
+@router.post("/run-overdue")
+def run_overdue(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Manually trigger the overdue reminder sweep (also runs daily in the background)."""
+    return overdue_sweep(db)
 
 
 @router.get("/summary", response_model=MetricsSummary)

@@ -8,7 +8,7 @@ import MiniMap from "@/components/MiniMap";
 import { SourceBadge } from "@/components/AgentBits";
 import { Icon } from "@/components/Icon";
 import {
-  getInspection, review, getZones, getIssues, reprocessInspection, rerunAnalysis,
+  getInspection, review, getZones, getIssues, reprocessInspection, rerunAnalysis, rephraseReview,
   type InspectionDetail, type FrameOut, type TaxonomyItem, type ZoneIssueLabel,
 } from "@/lib/api";
 import { fmtIST } from "@/lib/time";
@@ -37,6 +37,10 @@ function Detail() {
   const [labels, setLabels] = useState<ZoneIssueLabel[]>([]);
   const [zoneSel, setZoneSel] = useState("");
   const [issueSel, setIssueSel] = useState("");
+  // Agentic review: reviewer writes a free-text note; AI polishes it into a driver-facing reason
+  // and extracts structured labels.
+  const [aiReason, setAiReason] = useState<string | null>(null);
+  const [improving, setImproving] = useState(false);
   const viewed = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -99,16 +103,35 @@ function Detail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [insp?.id]);
 
+  async function improveWithAi() {
+    if (note.trim().length < 2) return;
+    setImproving(true);
+    setError(null);
+    try {
+      const context = (insp?.scoring?.zones ?? []).flatMap((z) =>
+        (z.issues || []).map((i) => ({ zone_key: z.zone_key, issue_key: i.issue_key }))
+      );
+      const res = await rephraseReview(note, context);
+      setAiReason(res.reason);
+      setLabels(res.labels);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not improve the note. You can still reject with your own text.");
+    } finally {
+      setImproving(false);
+    }
+  }
+
   async function act(action: "approve" | "reject") {
-    if (action === "reject" && labels.length === 0) {
-      setError("Select at least one zone and issue before rejecting.");
+    const reason = (aiReason?.trim() || note.trim());
+    if (action === "reject" && !reason && labels.length === 0) {
+      setError("Write a short note about what's dirty (AI will polish it), then reject.");
       return;
     }
     setBusy(true);
     setError(null);
     try {
       await review(id, action, {
-        reason: note || undefined,
+        reason: action === "reject" ? (reason || undefined) : (note || undefined),
         labels: action === "reject" ? labels : [],
         viewedFrameIds: Array.from(viewed.current),
         scoringResultId: insp?.scoring?.id,
@@ -116,6 +139,7 @@ function Detail() {
       await load();
       setLabels([]);
       setNote("");
+      setAiReason(null);
       setToast({ kind: "ok", msg: action === "approve" ? "Approved" : "Rejected" });
       setTimeout(() => setToast(null), 2500);
     } catch (e) {
@@ -148,14 +172,12 @@ function Detail() {
   async function confirmAgent() {
     const rec = agentRec();
     if (!rec) return;
-    if (rec.action === "reject" && rec.labels.length === 0) {
-      setError("Agent flagged low cleanliness but named no specific issue; reject manually below.");
-      return;
-    }
     setBusy(true); setError(null);
     try {
       await review(id, rec.action, {
-        reason: "Confirmed agent recommendation",
+        // When the agent named no specific zone (e.g. a content-gate / low-overall reject),
+        // carry its own reasoning instead of blocking the confirm.
+        reason: insp?.reject_reason || "Confirmed agent recommendation",
         labels: rec.labels,
         viewedFrameIds: Array.from(viewed.current),
         scoringResultId: insp?.scoring?.id,
@@ -219,7 +241,7 @@ function Detail() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canReview, busy, note, labels, id]);
+  }, [canReview, busy, note, labels, aiReason, id]);
 
   if (!id) return <div className="container error">No inspection id.</div>;
   if (error && !insp) return <div className="container error">{error}</div>;
@@ -422,19 +444,45 @@ function Detail() {
         ) : (
           <>
             <div className="dim" style={{ fontSize: 12, marginBottom: 8 }}>
-              To reject, tag each dirty zone with an issue. Approvals need no tags.
+              To reject, describe what&rsquo;s dirty in your own words. AI rewrites it clearly for the driver and tags the areas. Approvals need no note.
             </div>
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-              <select value={zoneSel} onChange={(e) => setZoneSel(e.target.value)}>
-                {zones.map((z) => <option key={z.key} value={z.key}>{z.label}</option>)}
-              </select>
-              <select value={issueSel} onChange={(e) => setIssueSel(e.target.value)}>
-                {issues.map((i) => <option key={i.key} value={i.key}>{i.label}</option>)}
-              </select>
-              <button className="ghost" onClick={addLabel}>Add issue</button>
-              <input placeholder="Optional note" value={note} onChange={(e) => setNote(e.target.value)} style={{ flex: 1, minWidth: 160 }} />
+            <textarea
+              value={note}
+              onChange={(e) => { setNote(e.target.value); if (aiReason !== null) setAiReason(null); }}
+              rows={3}
+              placeholder="e.g. back seat has crumbs and a drink stain, floor mats are muddy"
+              style={{ width: "100%", resize: "vertical", fontFamily: "inherit" }}
+            />
+            <div className="filters" style={{ marginTop: 10, marginBottom: 0 }}>
+              <button className="ghost" disabled={improving || note.trim().length < 2} onClick={improveWithAi}>
+                {improving ? "Improving…" : "✨ Improve with AI"}
+              </button>
+              <span className="review-hint" style={{ marginTop: 0 }}>Rewrites your note into a clear driver message and detects the dirty zones. Optional.</span>
             </div>
-            {labels.length > 0 ? (
+
+            {aiReason !== null ? (
+              <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 14 }}>
+                <div className="review-hint" style={{ marginTop: 0, marginBottom: 6 }}>DRIVER-FACING REASON (editable)</div>
+                <textarea
+                  value={aiReason}
+                  onChange={(e) => setAiReason(e.target.value)}
+                  rows={2}
+                  style={{ width: "100%", resize: "vertical", fontFamily: "inherit" }}
+                />
+                <div className="review-hint" style={{ marginTop: 8, marginBottom: 6 }}>
+                  {labels.length > 0 ? "DETECTED AREAS (click to remove)" : "No specific zone detected — the reason above will be sent to the driver."}
+                </div>
+                {labels.length > 0 ? (
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {labels.map((l, i) => (
+                      <span key={i} className="badge rejected" style={{ cursor: "pointer" }} onClick={() => removeLabel(i)} title="click to remove">
+                        {labelText(l)} ✕
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : labels.length > 0 ? (
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
                 {labels.map((l, i) => (
                   <span key={i} className="badge rejected" style={{ cursor: "pointer" }} onClick={() => removeLabel(i)} title="click to remove">
@@ -443,10 +491,13 @@ function Detail() {
                 ))}
               </div>
             ) : null}
+
             {error ? <div className="error" style={{ marginTop: 8 }}>{error}</div> : null}
             <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
               <button disabled={busy} onClick={() => act("approve")}>Approve</button>
-              <button className="danger" disabled={busy || labels.length === 0} onClick={() => act("reject")}>Reject ({labels.length})</button>
+              <button className="danger" disabled={busy || (!note.trim() && !aiReason && labels.length === 0)} onClick={() => act("reject")}>
+                Reject{labels.length ? ` (${labels.length})` : ""}
+              </button>
             </div>
             <div className="review-hint">
               Shortcuts: A approve · R reject · ← → move frames · Esc close · scroll to zoom

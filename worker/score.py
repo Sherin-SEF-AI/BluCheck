@@ -211,6 +211,27 @@ def _overview_call(paths: list[str], start_index: int, model_id: str, cfg: dict)
     return _chat(cfg, model_id, messages, SCORING_SCHEMA)
 
 
+def _attach_frame_ids(res: dict, frame_ids: list[str], start_index: int, kind: str) -> None:
+    """Tag each detected issue with the real frame id it belongs to, resolved WITHIN this call.
+
+    A capture is scored in its own call showing only that clip's frames, labelled start_index..
+    So an interior issue can only ever resolve to an interior frame -- the model cannot make us
+    point at an exterior photo for an interior problem (the failure the driver saw). If the
+    model's frame_index lands outside this call's range (a hallucinated index), we fall back to
+    the call's first frame and mark frame_exact=False so the UI can be honest about it."""
+    for z in res.get("zones", []) or []:
+        for iss in z.get("issues") or []:
+            fi = iss.get("frame_index")
+            local = (fi - start_index) if isinstance(fi, int) else None
+            if local is not None and 0 <= local < len(frame_ids):
+                iss["frame_id"] = frame_ids[local]
+                iss["frame_exact"] = True
+            elif frame_ids:
+                iss["frame_id"] = frame_ids[0]
+                iss["frame_exact"] = False
+            iss["kind"] = kind
+
+
 def _effective_zone_score(z: dict, scfg: dict) -> int | None:
     """Zone score after the severity floor: the worst issue's severity caps how high the zone
     can score. Only ever lowers a score, and only when the model was inconsistent (flagged a
@@ -348,7 +369,8 @@ def _ensemble(zone_votes: list[dict], scfg: dict) -> dict:
 
 
 def score_frames(
-    frames_by_kind: dict[str, list[str]], vlm_model: str, scoring_config: dict | None = None
+    frames_by_kind: dict[str, list[str]], vlm_model: str, scoring_config: dict | None = None,
+    frame_ids_by_kind: dict[str, list[str]] | None = None,
 ) -> tuple[dict, int, dict]:
     """Score an inspection. Exterior and interior are scored in separate calls (each capped at
     scoring_config.max_images_per_call frames), merged per zone, then an adaptive high-res zoom
@@ -366,6 +388,7 @@ def score_frames(
     # Collect one or more verdicts (votes) per zone, then ensemble, so a single call can't flip a
     # zone. Frames are numbered continuously so an issue's frame_index -> flat_paths is unique.
     flat_paths: list[str] = []
+    flat_ids: list[str] = []
     votes: dict[str, list[dict]] = {}
     reasons: list[str] = []
     vehicle_votes: list[bool] = []
@@ -374,6 +397,7 @@ def score_frames(
         ps = (frames_by_kind.get(kind) or [])[:max_images]
         if not ps:
             continue
+        ids = ((frame_ids_by_kind or {}).get(kind) or [])[:max_images]
         # Default: one batched call per capture (1 vote/zone). ensemble_per_frame: one call per
         # frame (1 vote/zone/frame) -> stronger ensembling at ~N x the image cost, off by default.
         batches = [[p] for p in ps] if per_frame else [ps]
@@ -383,6 +407,9 @@ def score_frames(
             image_count += len(batch)
             vehicle_votes.append(bool(res.get("is_vehicle", True)))
             reasons.append(res.get("reasoning", ""))
+            # Tag issues with the real frame id, resolved within this call (see _attach_frame_ids).
+            batch_ids = [ids[bi]] if per_frame and bi < len(ids) else ids
+            _attach_frame_ids(res, batch_ids, start_i, kind)
             source = f"overview:{kind}" + (f":f{start_i}" if per_frame else "")
             for z in res.get("zones", []):
                 zk = z.get("zone_key")
@@ -392,6 +419,7 @@ def score_frames(
                 v["source"] = source
                 votes.setdefault(zk, []).append(v)
         flat_paths += ps
+        flat_ids += ids
         idx += len(ps)
 
     # Content gate: if NO capture looked like a vehicle, this is not a car (a room, a person,
@@ -419,9 +447,19 @@ def score_frames(
                 if refined:
                     image_count += min(len(targets), max_images)
                     target_zones = {t["zone"] for t in targets}
+                    tgt_by_zone = {t["zone"]: t for t in targets}
                     for z in refined.get("zones", []):
                         zk = z.get("zone_key")
                         if zk in target_zones:
+                            # The zoom cropped a specific known frame; tag its issues with that
+                            # frame id so a zoom-derived detection is also frame-accurate.
+                            t = tgt_by_zone.get(zk) or {}
+                            tfi = t.get("frame_index")
+                            fid = flat_ids[tfi - 1] if isinstance(tfi, int) and 1 <= tfi <= len(flat_ids) else None
+                            for iss in z.get("issues") or []:
+                                if fid:
+                                    iss["frame_id"] = fid
+                                    iss["frame_exact"] = True
                             v = dict(z)
                             v["source"] = "zoom"
                             votes.setdefault(zk, []).append(v)  # zoom is another vote, not an override

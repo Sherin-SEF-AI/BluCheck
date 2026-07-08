@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from .. import audit
+from .. import audit, review_ai
 from ..auth import require_admin
 from ..db import get_db
 from ..models import (
@@ -24,12 +24,28 @@ from ..models import (
     ScoringResult,
     User,
 )
-from ..schemas import ReviewRequest
+from ..schemas import ReviewRephraseRequest, ReviewRephraseResponse, ReviewRequest, ZoneIssueLabel
 
 router = APIRouter(prefix="/inspections", tags=["review"])
 logger = logging.getLogger("blucheck.review")
 
 REVIEWABLE = {"pending", "approved", "rejected"}
+
+
+@router.post("/review-rephrase", response_model=ReviewRephraseResponse)
+def review_rephrase(
+    body: ReviewRephraseRequest, _admin: User = Depends(require_admin)
+) -> ReviewRephraseResponse:
+    """Agentic review helper: turn a reviewer's rough free-text note into a clear, driver-facing
+    rejection reason plus structured (zone, issue) labels. Preview only -- the reviewer confirms
+    with Approve/Reject. Does not touch the inspection."""
+    out = review_ai.rephrase(body.text, body.context)
+    if out is None:
+        raise HTTPException(status_code=502, detail="Could not rephrase right now; try again.")
+    return ReviewRephraseResponse(
+        reason=out["reason"],
+        labels=[ZoneIssueLabel(zone_key=l["zone_key"], issue_key=l["issue_key"]) for l in out["labels"]],
+    )
 
 
 def _summarize(labels) -> str:
@@ -53,10 +69,12 @@ def review_inspection(
         )
 
     if body.action == "reject":
-        if not body.labels:
+        # Prefer structured labels (the gold dataset), but allow a reason-only reject so an agent
+        # recommendation with no specific zone (content-gate / low-overall) can still be confirmed.
+        if not body.labels and not (body.reason and body.reason.strip()):
             raise HTTPException(
                 status_code=422,
-                detail="Rejection requires at least one zone and issue label",
+                detail="Rejection requires at least one zone/issue label or a reason",
             )
         for lbl in body.labels:
             if lbl.zone_key not in ZONE_KEYS:

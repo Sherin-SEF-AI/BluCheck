@@ -121,28 +121,37 @@ def complete_upload(
 
     db.flush()
 
-    # When both captures are uploaded, move to processing and guarantee extraction.
+    # When all expected captures are uploaded, move to processing and guarantee extraction.
+    # A normal inspection expects both exterior + interior; a targeted re-clean declares the
+    # flagged subset it re-films in device_meta.reclean_kinds.
     kinds_present = set(
         db.execute(
             select(Capture.kind).where(Capture.inspection_id == inspection_id)
         ).scalars()
     )
-    both_present = {"exterior", "interior"}.issubset(kinds_present)
-    if both_present and inspection.status in ("uploading", "failed"):
+    expected = {"exterior", "interior"}
+    if inspection.reinspection_of is not None and isinstance(inspection.device_meta, dict):
+        rk = inspection.device_meta.get("reclean_kinds")
+        if isinstance(rk, list):
+            sub = {k for k in rk if k in ("exterior", "interior")}
+            if sub:
+                expected = sub
+    ready = expected.issubset(kinds_present)
+    if ready and inspection.status in ("uploading", "failed"):
         inspection.status = "processing"
 
     db.commit()
     db.refresh(capture)
 
-    if both_present:
+    if ready:
         # Fallback to the primary S3 event notification.
         storage.enqueue_extraction(str(inspection_id))
 
     logger.info(
-        "capture_completed inspection=%s kind=%s both_present=%s status=%s",
+        "capture_completed inspection=%s kind=%s ready=%s status=%s",
         inspection_id,
         kind,
-        both_present,
+        ready,
         inspection.status,
     )
     return CompleteUploadResponse(

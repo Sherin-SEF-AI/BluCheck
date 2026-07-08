@@ -1,6 +1,7 @@
 import "./globals.css";
 import type { Metadata, Viewport } from "next";
 import RegisterSW from "@/components/RegisterSW";
+import AssistantWidget from "@/components/AssistantWidget";
 
 export const metadata: Metadata = {
   title: "BluCheck Admin",
@@ -29,6 +30,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         {children}
         <RegisterSW />
+        <AssistantWidget />
       </body>
     </html>
   );

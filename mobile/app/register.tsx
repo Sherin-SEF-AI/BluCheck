@@ -47,7 +47,7 @@ export default function Register() {
   return (
     <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
       <Text style={styles.title}>Register</Text>
-      <Text style={styles.subtitle}>One driver, one car. You sign in by scanning your plate and entering this PIN.</Text>
+      <Text style={styles.subtitle}>One driver, one car. You sign in with your car number and this PIN.</Text>
 
       <Text style={styles.label}>Full name</Text>
       <TextInput

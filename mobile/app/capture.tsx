@@ -11,28 +11,48 @@ import { enqueueCapture, processQueue } from "@/lib/uploadQueue";
 import { colors } from "@/lib/theme";
 
 const CLIP_SECONDS = 15;
-// Flow: ready -> prechecking (auto photo: car check + plate) -> [fail -> retry] -> exterior
+// Flow: ready -> prechecking (auto photo: is-this-a-vehicle check) -> [fail -> retry] -> exterior
 // (auto record) -> exterior_done (Start interior) -> interior (auto record) -> submitting.
+// A targeted re-clean (groups param) records only the flagged group(s), skipping the rest.
 type Step = "ready" | "prechecking" | "precheck_fail" | "exterior" | "exterior_done" | "interior" | "submitting" | "submit_error";
 type Clip = { uri: string; recordedAt: string };
 
+// Night inspections need light: the torch turns on automatically after dark (local time). The
+// driver can still override it. Camera APIs do not expose ambient lux, so time-of-day is used.
+function isNight(): boolean {
+  const h = new Date().getHours();
+  return h < 6 || h >= 18;
+}
+
 export default function Capture() {
-  const { vehicleId, plate, reinspectionOf } = useLocalSearchParams<{ vehicleId: string; plate: string; reinspectionOf?: string }>();
+  const { vehicleId, plate, reinspectionOf, groups, zones } = useLocalSearchParams<{
+    vehicleId: string; plate: string; reinspectionOf?: string; groups?: string; zones?: string;
+  }>();
   const cameraRef = useRef<CameraView>(null);
   const [camPerm, requestCam] = useCameraPermissions();
   const [micPerm, requestMic] = useMicrophonePermissions();
+
+  // Targeted re-clean: which capture groups to re-film. Defaults to a full inspection.
+  const targetGroups: ("exterior" | "interior")[] = (() => {
+    const raw = (groups ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    const set = raw.filter((g): g is "exterior" | "interior" => g === "exterior" || g === "interior");
+    return set.length ? Array.from(new Set(set)) : ["exterior", "interior"];
+  })();
+  const needExterior = targetGroups.includes("exterior");
+  const needInterior = targetGroups.includes("interior");
+  const isReclean = !!reinspectionOf;
+  const isTargeted = isReclean && targetGroups.length < 2;
 
   const [step, setStep] = useState<Step>("ready");
   const [remaining, setRemaining] = useState(CLIP_SECONDS);
   const [recording, setRecording] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
-  const [torch, setTorch] = useState(false);
+  const [torch, setTorch] = useState(isNight());
   const [facing, setFacing] = useState<CameraType>("back");
   const [error, setError] = useState<string | null>(null);
-  const [ocr, setOcr] = useState<Precheck | null>(null);
 
   const runningRef = useRef(false);
-  const clips = useRef<{ exterior?: Clip; interior?: Clip; gps?: Gps; startedAt?: string; ocr?: Precheck }>({});
+  const clips = useRef<{ exterior?: Clip; interior?: Clip; gps?: Gps; startedAt?: string }>({});
 
   useEffect(() => {
     if (!camPerm?.granted) requestCam();
@@ -85,12 +105,12 @@ export default function Capture() {
     }
   }
 
-  // Start: GPS -> auto photo -> car+plate pre-check. Non-car footage is rejected here, on the
-  // phone, before any recording. The plate is read automatically (no separate scan tap).
+  // Start: GPS -> auto photo -> is-this-a-vehicle pre-check. Non-car footage is rejected here, on
+  // the phone, before any recording. (Plate OCR is disabled for now.)
   async function beginFlow() {
     if (runningRef.current) return;
     runningRef.current = true;
-    setError(null); setOcr(null); clips.current.ocr = undefined;
+    setError(null);
     try {
       const fix = await captureGps();
       clips.current.gps = fix;
@@ -121,7 +141,7 @@ export default function Capture() {
     try {
       res = await precheckCapture(base64);
     } catch {
-      // If the check itself is unreachable, don't hard-block the driver: proceed without a plate.
+      // If the check itself is unreachable, don't hard-block the driver.
       res = { is_vehicle: true, vehicle_confidence: null, labels: [], read_plate: null, matched: false, expected: plate ?? null };
     }
     if (!res.is_vehicle) {
@@ -129,52 +149,68 @@ export default function Capture() {
       setError("This doesn't look like a vehicle. Point the camera at the car and try again.");
       return;
     }
-    clips.current.ocr = res; setOcr(res);
-    // Car confirmed -> record the exterior automatically.
-    setStep("exterior");
-    try {
-      clips.current.exterior = await recordOne("exterior");
-      setStep("exterior_done");
-    } catch (e) {
-      runningRef.current = false;
-      setStep("ready"); setRecording(false);
-      setError(e instanceof Error ? e.message : "Could not record exterior");
+    // Car confirmed. Record whichever groups this run needs. A targeted interior-only re-clean
+    // skips the exterior entirely and goes straight to interior.
+    if (needExterior) {
+      setStep("exterior");
+      try {
+        clips.current.exterior = await recordOne("exterior");
+        if (needInterior) {
+          setStep("exterior_done");
+        } else {
+          await submit();
+        }
+      } catch (e) {
+        runningRef.current = false;
+        setStep("ready"); setRecording(false);
+        setError(e instanceof Error ? e.message : "Could not record exterior");
+      }
+    } else {
+      // Interior-only re-clean.
+      await startInterior();
     }
   }
 
-  // Driver taps this after the exterior clip: records interior, then submits. BOTH clips must
-  // exist to complete the inspection (submit guards on it).
+  // Records the interior, then submits. All required clips must exist (submit guards on it).
   async function startInterior() {
     setError(null); setStep("interior");
     try {
       clips.current.interior = await recordOne("interior");
       await submit();
     } catch (e) {
-      setStep("exterior_done"); setRecording(false);
+      setStep(needExterior ? "exterior_done" : "ready"); setRecording(false);
+      if (!needExterior) runningRef.current = false;
       setError(e instanceof Error ? e.message : "Could not record interior");
     }
   }
 
   async function submit(): Promise<void> {
-    const { exterior, interior, gps, startedAt, ocr: ocrResult } = clips.current;
-    if (!exterior || !interior || !gps || !startedAt) {
-      setStep("exterior_done");
-      setError("Both exterior and interior clips are required to complete the inspection.");
+    const { exterior, interior, gps, startedAt } = clips.current;
+    const haveNeeded = (!needExterior || !!exterior) && (!needInterior || !!interior);
+    if (!haveNeeded || !gps || !startedAt) {
+      setStep(needExterior ? "exterior_done" : "ready");
+      setError("The required clip(s) are missing. Please record again.");
       return;
     }
     setStep("submitting"); setError(null);
     try {
+      // For a targeted re-clean, declare which kinds the backend should expect so it scores the
+      // subset (rather than waiting for both). Omitted for a normal full inspection.
+      const meta: Record<string, unknown> = deviceMeta();
+      if (isReclean) meta.reclean_kinds = targetGroups;
       const created = await createInspection({
         vehicle_id: String(vehicleId), gps,
         captured_at_utc: startedAt, captured_at_local: new Date().toString(),
-        device_meta: deviceMeta(),
-        ocr_plate: ocrResult?.read_plate ?? null,
-        ocr_matched: ocrResult?.matched ?? null,
+        device_meta: meta,
         reinspection_of: reinspectionOf ?? null,
       });
       const id = created.inspection_id;
-      await enqueueCapture({ inspectionId: id, kind: "exterior", videoUri: exterior.uri, gps, recordedAtUtc: exterior.recordedAt, durationS: CLIP_SECONDS, resolution: "1920x1080" });
-      await enqueueCapture({ inspectionId: id, kind: "interior", videoUri: interior.uri, gps, recordedAtUtc: interior.recordedAt, durationS: CLIP_SECONDS, resolution: "1920x1080" });
+      if (needExterior && exterior) {
+        await enqueueCapture({ inspectionId: id, kind: "exterior", videoUri: exterior.uri, gps, recordedAtUtc: exterior.recordedAt, durationS: CLIP_SECONDS, resolution: "1920x1080" });
+      }
+      if (needInterior && interior) {
+        await enqueueCapture({ inspectionId: id, kind: "interior", videoUri: interior.uri, gps, recordedAtUtc: interior.recordedAt, durationS: CLIP_SECONDS, resolution: "1920x1080" });
+      }
       processQueue().catch(() => undefined);
       router.replace("/upload-status");
     } catch (e) {
@@ -211,7 +247,6 @@ export default function Capture() {
       />
 
       {isRecordingStep && cameraReady ? <View style={styles.frameGuide} pointerEvents="none" /> : null}
-      {step === "prechecking" && cameraReady ? <View style={styles.plateGuide} pointerEvents="none" /> : null}
 
       {(isRecordingStep && !cameraReady) ? (
         <View style={styles.centerOverlay}>
@@ -223,7 +258,7 @@ export default function Capture() {
       {(isRecordingStep || step === "exterior_done") ? (
         <View style={styles.topControls}>
           <Pressable style={styles.ctrlBtn} onPress={() => setTorch((t) => !t)}>
-            <Text style={styles.ctrlText}>{torch ? "Torch On" : "Torch Off"}</Text>
+            <Text style={styles.ctrlText}>{torch ? "Torch On" : "Torch Off"}{isNight() ? " · auto" : ""}</Text>
           </Pressable>
           {!recording ? (
             <Pressable style={styles.ctrlBtn} onPress={() => setFacing((f) => (f === "back" ? "front" : "back"))}>
@@ -238,13 +273,27 @@ export default function Capture() {
 
         {step === "ready" && (
           <>
-            <Text style={styles.prompt}>
-              Point the camera at your car and tap Start. We'll check it's a vehicle, read the
-              plate automatically, then record exterior and interior clips of {CLIP_SECONDS}s each.
-            </Text>
+            {isReclean ? (
+              <View style={styles.recleanBanner}>
+                <Text style={styles.recleanTitle}>RE-CLEAN{isTargeted ? " · targeted" : ""}</Text>
+                {zones ? <Text style={styles.recleanZones}>Re-film only: {zones}</Text> : null}
+                <Text style={styles.prompt}>
+                  {needExterior && needInterior
+                    ? `We'll record the exterior and interior (${CLIP_SECONDS}s each).`
+                    : needInterior
+                      ? `We'll record only the interior (${CLIP_SECONDS}s) - no full walk-around needed.`
+                      : `We'll record only the exterior (${CLIP_SECONDS}s).`}
+                </Text>
+              </View>
+            ) : (
+              <Text style={styles.prompt}>
+                Point the camera at your car and tap Start. We'll check it's a vehicle, then record
+                exterior and interior clips of {CLIP_SECONDS}s each.
+              </Text>
+            )}
             {error ? <Text style={styles.error}>{error}</Text> : null}
             <Pressable style={styles.button} onPress={beginFlow}>
-              <Text style={styles.buttonText}>Start inspection</Text>
+              <Text style={styles.buttonText}>{isReclean ? "Start re-clean" : "Start inspection"}</Text>
             </Pressable>
           </>
         )}
@@ -252,7 +301,7 @@ export default function Capture() {
         {step === "prechecking" && (
           <View style={styles.recRow}>
             <ActivityIndicator color={colors.accent} />
-            <Text style={styles.prompt}>Checking vehicle &amp; reading plate...</Text>
+            <Text style={styles.prompt}>Checking it's a vehicle...</Text>
           </View>
         )}
 
@@ -284,12 +333,6 @@ export default function Capture() {
         {step === "exterior_done" && (
           <>
             <Text style={styles.stepLabel}>EXTERIOR DONE ✓</Text>
-            {ocr?.read_plate ? (
-              <Text style={styles.prompt}>
-                Plate read: <Text style={styles.mono}>{ocr.read_plate}</Text>{" "}
-                {ocr.matched ? <Text style={{ color: colors.ok }}>(matches)</Text> : <Text style={{ color: colors.warn }}>(flagged)</Text>}
-              </Text>
-            ) : null}
             <Text style={styles.prompt}>Now record the interior to complete the inspection.</Text>
             {error ? <Text style={styles.error}>{error}</Text> : null}
             <Pressable style={styles.button} onPress={startInterior}>
@@ -343,4 +386,7 @@ const styles = StyleSheet.create({
   buttonText: { color: "#ffffff", fontWeight: "700" },
   skip: { padding: 12, alignItems: "center" },
   skipText: { color: colors.textDim },
+  recleanBanner: { borderColor: colors.accent, borderWidth: 1, borderRadius: 8, padding: 12, gap: 6, backgroundColor: "rgba(74,157,142,0.12)" },
+  recleanTitle: { color: colors.accent, fontFamily: colors.mono, fontWeight: "700", letterSpacing: 1, fontSize: 12 },
+  recleanZones: { color: colors.text, fontFamily: colors.mono, fontSize: 13 },
 });

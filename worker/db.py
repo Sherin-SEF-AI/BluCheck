@@ -38,6 +38,10 @@ class Inspection(Base):
     __tablename__ = "inspections"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     status: Mapped[str] = mapped_column(String(16))
+    # Read by the ready-to-score gate: a targeted re-clean (reinspection_of set) may carry a
+    # subset of captures, declared in device_meta.reclean_kinds.
+    reinspection_of: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    device_meta: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class Capture(Base):

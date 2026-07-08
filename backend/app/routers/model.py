@@ -33,7 +33,7 @@ from ..models import (
     ZoneScore,
 )
 from .. import calibration as calib
-from .. import scoring_defaults, scoring_math
+from .. import scoring_defaults, scoring_math, sop as sop_gen, tuning_ai
 from ..schemas import (
     AgentActivityItem,
     AgentActivityResponse,
@@ -44,11 +44,22 @@ from ..schemas import (
     ModelPerformance,
     ModelThresholdsRequest,
     ModelVersionOut,
+    PolicyListResponse,
+    PolicyMutateResponse,
+    PolicyOut,
+    PolicySaveRequest,
+    PolicyUpdateRequest,
+    RecommendedSop,
     RecommendThresholdsRequest,
     RecommendThresholdsResponse,
     RunPendingResponse,
     ScoringConfigRequest,
     ScoringConfigResponse,
+    SopApplyRequest,
+    SopGenerateRequest,
+    SopProposal,
+    TuningEvidence,
+    TuningSuggestion,
     ValidationReport,
     ZoneIssueLabel,
 )
@@ -378,6 +389,292 @@ def calibrate(
         min_bin_support=curve["min_bin_support"],
         bins=curve["bins"],
         built_at=built_at,
+    )
+
+
+@router.post("/sop/generate", response_model=SopProposal)
+def sop_generate(
+    body: SopGenerateRequest, _admin: User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Agentic SOP generator: translate a natural-language cleanliness policy into a proposed
+    scoring config + thresholds. PREVIEW ONLY -- the admin reviews and applies separately."""
+    mv = ensure_active_model_version(db)
+    current = {
+        **scoring_defaults.resolve(mv.scoring_config),
+        "thresholds": mv.thresholds,
+    }
+    proposal = sop_gen.generate(body.sop, current)
+    if proposal is None:
+        raise HTTPException(status_code=502, detail="Could not generate an SOP right now; try again.")
+    return SopProposal(**proposal)
+
+
+@router.post("/sop/apply", response_model=ScoringConfigResponse)
+def sop_apply(
+    body: SopApplyRequest, admin: User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Apply a reviewed SOP: set the scoring config + thresholds and record the policy text.
+    Only recognized scoring keys are kept. Audited."""
+    mv = ensure_active_model_version(db)
+    incoming = {k: v for k, v in (body.scoring_config or {}).items() if k in scoring_defaults.DEFAULTS}
+    mv.scoring_config = {**(mv.scoring_config or {}), **incoming, "_sop": body.sop[:2000]}
+    ov = ((body.thresholds or {}).get("overall") or {})
+    thresholds = {**(mv.thresholds or {})}
+    thresholds["overall"] = {**(thresholds.get("overall") or {}), **{k: ov[k] for k in ("auto_approve", "auto_reject") if k in ov}}
+    mv.thresholds = thresholds
+    audit.record(
+        db, actor_id=admin.id, action="model_apply_sop", entity="model_version",
+        entity_id=str(mv.id), detail={"sop": body.sop[:500], "scoring_config": incoming, "thresholds": ov},
+    )
+    db.commit()
+    db.refresh(mv)
+    logger.info("SOP applied by=%s", admin.id)
+    return ScoringConfigResponse(
+        effective=scoring_defaults.resolve(mv.scoring_config),
+        stored=mv.scoring_config,
+        defaults=scoring_defaults.DEFAULTS,
+    )
+
+
+# ----- Saved policy library (edit/delete/activate + recommended templates) -----
+# Policies are stored inside the active model version's scoring_config under the "_policies"
+# key, with "_active_policy" holding the active policy id. Both keys are ignored by the worker
+# (scoring_defaults.resolve keeps only known scoring knobs), so no schema change is needed.
+
+
+def _policies_of(mv) -> list[dict]:
+    return [dict(p) for p in ((mv.scoring_config or {}).get("_policies") or []) if isinstance(p, dict)]
+
+
+def _active_policy_id(mv) -> str | None:
+    return (mv.scoring_config or {}).get("_active_policy")
+
+
+def _norm_thresholds(thresholds: dict | None) -> dict:
+    ov = ((thresholds or {}).get("overall") or {})
+    keep = {}
+    for k in ("auto_approve", "auto_reject"):
+        if k in ov:
+            try:
+                keep[k] = int(ov[k])
+            except (TypeError, ValueError):
+                pass
+    return {"overall": keep}
+
+
+def _apply_config_to_mv(mv, scoring_config: dict, thresholds: dict, sop: str) -> None:
+    """Copy a policy's scoring knobs + overall thresholds onto the live model version."""
+    incoming = {k: v for k, v in (scoring_config or {}).items() if k in scoring_defaults.DEFAULTS}
+    cfg = {**(mv.scoring_config or {}), **incoming, "_sop": (sop or "")[:2000]}
+    mv.scoring_config = cfg
+    ov = _norm_thresholds(thresholds)["overall"]
+    th = {**(mv.thresholds or {})}
+    th["overall"] = {**(th.get("overall") or {}), **ov}
+    mv.thresholds = th
+
+
+def _set_library(mv, policies: list[dict], active_id: str | None) -> None:
+    cfg = {**(mv.scoring_config or {}), "_policies": policies, "_active_policy": active_id}
+    mv.scoring_config = cfg
+
+
+def _policy_out(p: dict, active_id: str | None) -> PolicyOut:
+    return PolicyOut(
+        id=p.get("id", ""),
+        name=p.get("name", "Untitled"),
+        sop=p.get("sop", ""),
+        scoring_config=p.get("scoring_config") or {},
+        thresholds=p.get("thresholds") or {},
+        summary=p.get("summary", "") or "",
+        active=(p.get("id") == active_id),
+        created_at=p.get("created_at"),
+        updated_at=p.get("updated_at"),
+    )
+
+
+def _mutate_response(mv) -> PolicyMutateResponse:
+    active_id = _active_policy_id(mv)
+    return PolicyMutateResponse(
+        policies=[_policy_out(p, active_id) for p in _policies_of(mv)], active_id=active_id
+    )
+
+
+@router.get("/policies", response_model=PolicyListResponse)
+def list_policies(_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """The saved policy library, the active policy id, and the recommended starter templates."""
+    mv = ensure_active_model_version(db)
+    active_id = _active_policy_id(mv)
+    return PolicyListResponse(
+        policies=[_policy_out(p, active_id) for p in _policies_of(mv)],
+        active_id=active_id,
+        recommended=[RecommendedSop(**r) for r in sop_gen.RECOMMENDED],
+    )
+
+
+@router.post("/policies", response_model=PolicyMutateResponse)
+def save_policy(
+    body: PolicySaveRequest, admin: User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Save a reviewed proposal as a named policy. Optionally activate it immediately."""
+    mv = ensure_active_model_version(db)
+    pols = _policies_of(mv)
+    now = datetime.now(timezone.utc).isoformat()
+    pol = {
+        "id": uuid.uuid4().hex,
+        "name": body.name.strip()[:120],
+        "sop": body.sop[:2000],
+        "scoring_config": {k: v for k, v in (body.scoring_config or {}).items() if k in scoring_defaults.DEFAULTS},
+        "thresholds": _norm_thresholds(body.thresholds),
+        "summary": (body.summary or "")[:1200],
+        "created_at": now,
+        "updated_at": now,
+    }
+    pols.append(pol)
+    active_id = _active_policy_id(mv)
+    if body.activate:
+        _apply_config_to_mv(mv, pol["scoring_config"], pol["thresholds"], pol["sop"])
+        active_id = pol["id"]
+    _set_library(mv, pols, active_id)
+    audit.record(
+        db, actor_id=admin.id, action="policy_save", entity="model_version",
+        entity_id=str(mv.id), detail={"policy_id": pol["id"], "name": pol["name"], "activated": body.activate},
+    )
+    db.commit()
+    db.refresh(mv)
+    return _mutate_response(mv)
+
+
+@router.put("/policies/{pid}", response_model=PolicyMutateResponse)
+def update_policy(
+    pid: str, body: PolicyUpdateRequest, admin: User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Edit a saved policy. If it is the active one, its live config is re-applied."""
+    mv = ensure_active_model_version(db)
+    pols = _policies_of(mv)
+    idx = next((i for i, p in enumerate(pols) if p.get("id") == pid), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    p = pols[idx]
+    if body.name is not None:
+        p["name"] = body.name.strip()[:120] or p.get("name", "Untitled")
+    if body.sop is not None:
+        p["sop"] = body.sop[:2000]
+    if body.scoring_config is not None:
+        p["scoring_config"] = {k: v for k, v in body.scoring_config.items() if k in scoring_defaults.DEFAULTS}
+    if body.thresholds is not None:
+        p["thresholds"] = _norm_thresholds(body.thresholds)
+    if body.summary is not None:
+        p["summary"] = body.summary[:1200]
+    p["updated_at"] = datetime.now(timezone.utc).isoformat()
+    pols[idx] = p
+    active_id = _active_policy_id(mv)
+    if pid == active_id:
+        _apply_config_to_mv(mv, p.get("scoring_config") or {}, p.get("thresholds") or {}, p.get("sop") or "")
+    _set_library(mv, pols, active_id)
+    audit.record(
+        db, actor_id=admin.id, action="policy_update", entity="model_version",
+        entity_id=str(mv.id), detail={"policy_id": pid, "reapplied": pid == active_id},
+    )
+    db.commit()
+    db.refresh(mv)
+    return _mutate_response(mv)
+
+
+@router.delete("/policies/{pid}", response_model=PolicyMutateResponse)
+def delete_policy(
+    pid: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Delete a saved policy. Deleting the active policy leaves the live scoring config in place
+    but clears the active pointer (nothing silently changes what the worker uses)."""
+    mv = ensure_active_model_version(db)
+    pols = _policies_of(mv)
+    remaining = [p for p in pols if p.get("id") != pid]
+    if len(remaining) == len(pols):
+        raise HTTPException(status_code=404, detail="Policy not found")
+    active_id = _active_policy_id(mv)
+    if active_id == pid:
+        active_id = None
+    _set_library(mv, remaining, active_id)
+    audit.record(
+        db, actor_id=admin.id, action="policy_delete", entity="model_version",
+        entity_id=str(mv.id), detail={"policy_id": pid},
+    )
+    db.commit()
+    db.refresh(mv)
+    return _mutate_response(mv)
+
+
+@router.post("/policies/{pid}/activate", response_model=PolicyMutateResponse)
+def activate_policy(
+    pid: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Make a saved policy the live cleanliness criteria (copies its config onto the worker)."""
+    mv = ensure_active_model_version(db)
+    pols = _policies_of(mv)
+    pol = next((p for p in pols if p.get("id") == pid), None)
+    if pol is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    _apply_config_to_mv(mv, pol.get("scoring_config") or {}, pol.get("thresholds") or {}, pol.get("sop") or "")
+    _set_library(mv, pols, pid)
+    audit.record(
+        db, actor_id=admin.id, action="policy_activate", entity="model_version",
+        entity_id=str(mv.id), detail={"policy_id": pid, "name": pol.get("name")},
+    )
+    db.commit()
+    db.refresh(mv)
+    logger.info("policy activated id=%s by=%s", pid, admin.id)
+    return _mutate_response(mv)
+
+
+@router.get("/tuning-suggestion", response_model=TuningSuggestion)
+def tuning_suggestion(
+    days: int = 30, _admin: User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Self-tuning policy agent: analyze where humans overturned the agent and propose a modest
+    scoring/threshold adjustment to reduce those disagreements. Preview only -- apply via the
+    existing SOP/policy apply path."""
+    mv = ensure_active_model_version(db)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    overrides = db.execute(
+        select(Review).where(Review.source == "model_overridden", Review.created_at >= cutoff)
+    ).scalars().all()
+    too_strict = too_lenient = 0
+    strict_zones: dict = {}
+    lenient_zones: dict = {}
+    for r in overrides:
+        if not r.scoring_result_id:
+            continue
+        zrows = db.execute(
+            select(ZoneScore).where(ZoneScore.scoring_result_id == r.scoring_result_id)
+        ).scalars().all()
+        flagged = [z.zone_key for z in zrows if (z.issues or [])]
+        if r.action == "approve":  # agent rejected, human approved -> agent too strict
+            too_strict += 1
+            for zk in flagged:
+                strict_zones[zk] = strict_zones.get(zk, 0) + 1
+        else:  # agent approved, human rejected -> agent too lenient
+            too_lenient += 1
+            for zk in flagged:
+                lenient_zones[zk] = lenient_zones.get(zk, 0) + 1
+    evidence = TuningEvidence(
+        days=days, overrides=len(overrides), too_strict=too_strict, too_lenient=too_lenient,
+        strict_zones=strict_zones, lenient_zones=lenient_zones,
+    )
+    if len(overrides) < 4:
+        return TuningSuggestion(
+            no_change=True, confidence=0.0, evidence=evidence,
+            summary=f"Only {len(overrides)} override(s) in the last {days} days -- not enough signal to tune yet. Keep reviewing and check back.",
+        )
+    current = {
+        **scoring_defaults.resolve(mv.scoring_config),
+        "thresholds": (mv.thresholds or {}).get("overall", {}),
+    }
+    out = tuning_ai.suggest(evidence.model_dump(), current)
+    if out is None:
+        raise HTTPException(status_code=502, detail="Could not generate a tuning suggestion right now; try again.")
+    return TuningSuggestion(
+        no_change=out["no_change"], confidence=out["confidence"], summary=out["summary"],
+        scoring_config=out.get("scoring_config"), thresholds=out.get("thresholds"), evidence=evidence,
     )
 
 

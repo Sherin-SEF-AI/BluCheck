@@ -196,6 +196,20 @@ class FrameOut(BaseModel):
     blur_score: float | None = None
 
 
+class FlaggedFrame(BaseModel):
+    zone_key: str
+    zone_label: str
+    issue_key: str
+    severity: str | None = None
+    description: str | None = None
+    frame_id: uuid.UUID
+    kind: str
+    thumb_url: str
+    annotated_endpoint: str  # boxed full-res version, drawn on demand
+    bbox: list[float] | None = None
+    exact: bool = True  # False when we fell back to a representative frame of the zone's area
+
+
 class CaptureDetail(BaseModel):
     id: uuid.UUID
     kind: str
@@ -248,6 +262,10 @@ class InspectionDetail(BaseModel):
     reviewed_at: datetime | None
     reject_reason: str | None
     reject_labels: list[ZoneIssueLabel] = []
+    # The exact frames a rejection is based on: each detected issue mapped to the analyzed frame
+    # that shows it (resolved by capture kind, with a safe fallback). Drives the driver's
+    # "clean these" photos.
+    flagged_frames: list[FlaggedFrame] = []
     scoring: dict[str, Any] | None = None  # populated once the VLM scoring stage is live
     decision_source: str | None = None  # "agent" | "human" | None
     ocr_plate: str | None = None
@@ -407,6 +425,199 @@ class ScoringConfigResponse(BaseModel):
     effective: dict[str, Any]
     stored: dict[str, Any] | None
     defaults: dict[str, Any]
+
+
+class SopGenerateRequest(BaseModel):
+    sop: str = Field(min_length=4, max_length=2000)
+
+
+class SopProposal(BaseModel):
+    scoring_config: dict[str, Any]
+    thresholds: dict[str, Any]
+    summary: str
+    priorities: list[str] = []
+
+
+class SopApplyRequest(BaseModel):
+    sop: str
+    scoring_config: dict[str, Any]
+    thresholds: dict[str, Any]
+
+
+class RecommendedSop(BaseModel):
+    title: str
+    sop: str
+
+
+class PolicyOut(BaseModel):
+    id: str
+    name: str
+    sop: str
+    scoring_config: dict[str, Any]
+    thresholds: dict[str, Any]
+    summary: str = ""
+    active: bool = False
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class PolicySaveRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    sop: str = Field(min_length=4, max_length=2000)
+    scoring_config: dict[str, Any]
+    thresholds: dict[str, Any]
+    summary: str = ""
+    activate: bool = False
+
+
+class PolicyUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    sop: str | None = Field(default=None, max_length=2000)
+    scoring_config: dict[str, Any] | None = None
+    thresholds: dict[str, Any] | None = None
+    summary: str | None = None
+
+
+class PolicyListResponse(BaseModel):
+    policies: list[PolicyOut]
+    active_id: str | None = None
+    recommended: list[RecommendedSop] = []
+
+
+class PolicyMutateResponse(BaseModel):
+    policies: list[PolicyOut]
+    active_id: str | None = None
+
+
+class TuningEvidence(BaseModel):
+    days: int
+    overrides: int
+    too_strict: int  # agent rejected, human approved
+    too_lenient: int  # agent approved, human rejected
+    strict_zones: dict[str, int] = {}
+    lenient_zones: dict[str, int] = {}
+
+
+class TuningSuggestion(BaseModel):
+    no_change: bool
+    confidence: float = 0.0
+    summary: str = ""
+    scoring_config: dict[str, Any] | None = None
+    thresholds: dict[str, Any] | None = None
+    evidence: TuningEvidence
+
+
+class OverdueVehicle(BaseModel):
+    driver_id: str
+    plate: str
+    name: str
+    last_approved_at: datetime | None = None
+    hours_overdue: float | None = None  # hours past the cadence deadline (None if never inspected)
+    never: bool = False
+    severity: str  # "due" | "critical"
+
+
+class OverdueResponse(BaseModel):
+    cadence_hours: int
+    count: int
+    items: list[OverdueVehicle] = []
+
+
+class CadenceRequest(BaseModel):
+    cadence_hours: int = Field(ge=1, le=8760)
+
+
+class CadenceResponse(BaseModel):
+    cadence_hours: int
+
+
+class ReviewRephraseRequest(BaseModel):
+    text: str = Field(min_length=2, max_length=1500)
+    context: list[dict[str, Any]] | None = None  # optional model-flagged issues for grounding
+
+
+class ReviewRephraseResponse(BaseModel):
+    reason: str
+    labels: list[ZoneIssueLabel] = []
+
+
+class AssistantMessage(BaseModel):
+    role: str
+    content: str
+
+
+class AssistantAskRequest(BaseModel):
+    messages: list[AssistantMessage] = Field(min_length=1, max_length=24)
+    context: dict[str, Any] | None = None  # {page, inspection_id} for page-aware answers
+
+
+class AssistantPendingAction(BaseModel):
+    tool: str
+    args: dict[str, Any] = {}
+    title: str
+    detail: str = ""
+
+
+class AssistantAskResponse(BaseModel):
+    answer: str
+    pending_actions: list[AssistantPendingAction] = []
+
+
+class AssistantExecuteRequest(BaseModel):
+    tool: str
+    args: dict[str, Any] = {}
+
+
+class AssistantExecuteResponse(BaseModel):
+    ok: bool
+    message: str
+
+
+class CoachingResponse(BaseModel):
+    headline: str
+    tip: str
+    focus_zone: str = ""
+
+
+class RewardTier(BaseModel):
+    name: str
+    min_points: int
+
+
+class RewardEvent(BaseModel):
+    date: str
+    label: str
+    points: int
+
+
+class RewardsResponse(BaseModel):
+    points: int
+    tier: str
+    next_tier_at: int | None = None
+    streak_days: int
+    approved_count: int
+    first_pass_count: int
+    total_inspections: int
+    this_month_points: int
+    tiers: list[RewardTier] = []
+    recent: list[RewardEvent] = []
+    per_approved: int
+    per_first_pass: int
+    per_streak_day: int
+
+
+class LeaderboardRow(BaseModel):
+    driver_id: str
+    name: str
+    car_number: str | None = None
+    points: int
+    tier: str
+    approved_count: int
+    streak_days: int
+
+
+class LeaderboardResponse(BaseModel):
+    rows: list[LeaderboardRow] = []
 
 
 class CalibrateRequest(BaseModel):

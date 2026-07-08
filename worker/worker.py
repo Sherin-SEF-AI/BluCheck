@@ -103,6 +103,18 @@ def _send_cap(db) -> int:
     return 5
 
 
+def _expected_kinds(inspection) -> set[str]:
+    """Which capture kinds an inspection must have before it is ready to score. Normally both;
+    a targeted re-clean declares a subset in device_meta.reclean_kinds."""
+    if getattr(inspection, "reinspection_of", None) is not None:
+        meta = getattr(inspection, "device_meta", None)
+        if isinstance(meta, dict) and isinstance(meta.get("reclean_kinds"), list):
+            sub = {k for k in meta["reclean_kinds"] if k in ("exterior", "interior")}
+            if sub:
+                return sub
+    return {"exterior", "interior"}
+
+
 def _process_capture(db, capture: Capture) -> bool:
     """Extract one capture. Returns True on success. Idempotent (deletes prior frames).
 
@@ -264,13 +276,17 @@ def run_scoring(db, inspection_id) -> None:
         # separate calls (vision models cap images per request); this also keeps each
         # zone's frames together.
         frames_by_kind: dict[str, list[str]] = {}
+        frame_ids_by_kind: dict[str, list[str]] = {}
         for i, (frame, kind) in enumerate(rows):
             p = os.path.join(tmp, f"f{i}.jpg")
             _s3.download_file(MEDIA_BUCKET, frame.s3_key_full, p)
             frames_by_kind.setdefault(kind, []).append(p)
+            # Parallel real frame ids so scoring can tag each issue with the exact frame it is in.
+            frame_ids_by_kind.setdefault(kind, []).append(str(frame.id))
         try:
             result, latency, stats = score_frames(
-                frames_by_kind, mv.vlm_model or "", mv.scoring_config
+                frames_by_kind, mv.vlm_model or "", mv.scoring_config,
+                frame_ids_by_kind=frame_ids_by_kind,
             )
         except ScoringError as e:
             logger.warning("scoring failed inspection=%s: %s (leaving for human)", inspection_id, e)
@@ -359,7 +375,14 @@ def handle_message(body: dict) -> None:
             inspection = db.get(Inspection, uuid.UUID(inspection_id))
             if inspection is None:
                 continue
-            if {"exterior", "interior"}.issubset(kinds_extracted):
+            # A normal inspection scores once BOTH captures are extracted. A targeted re-clean
+            # (reinspection_of set) re-films only the flagged group(s), so it declares which kinds
+            # to expect in device_meta.reclean_kinds; score once exactly those are extracted and no
+            # capture is still mid-flight (prevents scoring a 2-group re-clean before both land).
+            all_extracted = bool(captures) and all(c.status == "extracted" for c in captures)
+            expected = _expected_kinds(inspection)
+            ready = bool(expected) and expected.issubset(kinds_extracted) and all_extracted
+            if ready:
                 inspection.status = "pending"
                 db.commit()
                 logger.info("inspection %s -> pending", inspection_id)

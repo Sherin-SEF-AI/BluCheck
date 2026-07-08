@@ -11,9 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, joinedload
 
-from .. import agent, audit, storage
+from .. import agent, appeal_ai, audit, scoring_defaults, self_heal, storage
 from ..auth import get_current_user, require_admin
 from ..db import get_db
+from ..modelcfg import ensure_active_model_version
 from ..models import (
     Capture,
     Frame,
@@ -28,6 +29,7 @@ from ..models import (
 )
 from ..schemas import (
     CaptureDetail,
+    FlaggedFrame,
     FrameOut,
     FrameUrlResponse,
     InspectionCreate,
@@ -38,6 +40,25 @@ from ..schemas import (
     PlateVerifyRequest,
     ZoneIssueLabel,
 )
+
+# Which capture a zone is seen in, so a flagged zone's photo comes from the right clip. Windows
+# and glass are captured in the exterior walk-around.
+ZONE_TO_KIND = {
+    "seats": "interior",
+    "floor_mats": "interior",
+    "dashboard_console": "interior",
+    "exterior_body": "exterior",
+    "windows_glass": "exterior",
+    "boot": "exterior",
+}
+ZONE_LABELS = {
+    "seats": "Seats",
+    "floor_mats": "Floor mats",
+    "dashboard_console": "Dashboard",
+    "exterior_body": "Exterior body",
+    "windows_glass": "Windows / glass",
+    "boot": "Boot",
+}
 
 router = APIRouter(prefix="/inspections", tags=["inspections"])
 logger = logging.getLogger("blucheck.inspections")
@@ -76,27 +97,28 @@ def precheck(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """One-shot capture pre-check run automatically by the app before recording: (1) is this a
-    vehicle at all (so non-car footage is rejected on the phone), and (2) read the plate and
-    correlate to the driver's registered car -- no separate 'scan plate' tap needed."""
+    """One-shot capture pre-check run automatically by the app before recording: is this a
+    vehicle at all, so non-car footage is rejected on the phone before any upload.
+
+    Plate OCR is disabled for now (read_plate always null); the response keeps the plate fields
+    so the client contract is unchanged and OCR can be re-enabled later without a client update."""
     import base64 as _b64
 
     from .. import plateocr
 
-    if user.role != "driver" or not user.car_number:
-        raise HTTPException(status_code=400, detail="Only registered drivers can pre-check")
+    if user.role != "driver":
+        raise HTTPException(status_code=400, detail="Only drivers can pre-check")
     try:
         img = _b64.b64decode(body.image_b64)
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid image data")
     veh = plateocr.detect_vehicle(img)
-    plate = plateocr.read_plate(img, user.car_number)
     return {
         "is_vehicle": veh["is_vehicle"],
         "vehicle_confidence": veh["confidence"],
         "labels": veh["labels"],
-        "read_plate": plate["read_plate"],
-        "matched": plate["matched"],
+        "read_plate": None,
+        "matched": False,
         "expected": user.car_number,
     }
 
@@ -237,6 +259,95 @@ def list_inspections(
     return InspectionListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
+def _build_flagged_frames(inspection, scoring, reject_labels, max_images):
+    """Map each detected issue to the exact analyzed frame that shows it.
+
+    The worker sends selected frames to the VLM as one continuous list, exterior clip first then
+    interior, each capped at max_images, ordered by frame sequence. An issue's 1-based frame_index
+    points into that list. We rebuild the same list to resolve it. Because the VLM's frame_index
+    can be unreliable, we VALIDATE the resolved frame belongs to the zone's own clip and otherwise
+    fall back to a representative frame of that clip (exact=False), so the driver never sees an
+    exterior photo for an interior problem."""
+    # Rebuild the flat list the worker scored: [exterior selected..][interior selected..].
+    by_kind: dict[str, list] = {}
+    frames_by_id: dict = {}
+    for cap in inspection.captures:
+        sel = sorted([f for f in cap.frames if f.selected], key=lambda x: x.seq)[:max_images]
+        by_kind[cap.kind] = sel
+        for f in cap.frames:
+            frames_by_id[str(f.id)] = f
+    flat = list(by_kind.get("exterior", [])) + list(by_kind.get("interior", []))
+
+    def frame_payload(frame, zone_key, issue_key, severity, description, bbox, exact):
+        return FlaggedFrame(
+            zone_key=zone_key,
+            zone_label=ZONE_LABELS.get(zone_key, zone_key.replace("_", " ").title()),
+            issue_key=issue_key,
+            severity=severity,
+            description=description,
+            frame_id=frame.id,
+            kind=ZONE_TO_KIND.get(zone_key, "interior"),
+            thumb_url=storage.presign_get(frame.s3_key_thumb),
+            annotated_endpoint=f"/inspections/{inspection.id}/frames/{frame.id}/annotated",
+            bbox=[float(x) for x in bbox] if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
+            exact=exact,
+        )
+
+    flagged_zone_keys = {l.zone_key for l in reject_labels}
+    zones_by_key = {z["zone_key"]: z for z in (scoring or {}).get("zones", [])} if scoring else {}
+    out: list[FlaggedFrame] = []
+    seen: set = set()
+
+    def fallback_frame(kind):
+        return (by_kind.get(kind) or [None])[0]
+
+    for zone_key in flagged_zone_keys:
+        expected_kind = ZONE_TO_KIND.get(zone_key, "interior")
+        issues = (zones_by_key.get(zone_key) or {}).get("issues") or []
+        if not issues:
+            fr = fallback_frame(expected_kind)
+            if fr and (fr.id, zone_key, "") not in seen:
+                seen.add((fr.id, zone_key, ""))
+                out.append(frame_payload(fr, zone_key, "", None, None, None, exact=False))
+            continue
+        for iss in issues:
+            frame = None
+            exact = True
+            # Preferred: the scorer tagged this issue with the exact frame id it detected the
+            # issue in (frame-accurate, resolved per-call so it is always the right clip).
+            fid = iss.get("frame_id")
+            if isinstance(fid, str) and fid in frames_by_id:
+                frame = frames_by_id[fid]
+                exact = bool(iss.get("frame_exact", True))
+            else:
+                # Legacy scores (no frame_id): resolve the model's frame_index and validate kind.
+                fi = iss.get("frame_index")
+                if isinstance(fi, int) and 1 <= fi <= len(flat):
+                    cand = flat[fi - 1]
+                    cand_kind = next((k for k, fs in by_kind.items() if cand in fs), None)
+                    if cand_kind == expected_kind:
+                        frame = cand
+                if frame is None:
+                    frame = fallback_frame(expected_kind)
+                    exact = False
+            if frame is None:
+                continue
+            key = (frame.id, zone_key, iss.get("issue_key", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                frame_payload(
+                    frame, zone_key, iss.get("issue_key", ""), iss.get("severity"),
+                    iss.get("description"), iss.get("bbox"), exact,
+                )
+            )
+    # Most severe first so the driver sees the worst offenders at the top.
+    order = {"severe": 0, "moderate": 1, "minor": 2, None: 3}
+    out.sort(key=lambda f: order.get(f.severity, 3))
+    return out[:8]
+
+
 @router.get("/{inspection_id}", response_model=InspectionDetail)
 def get_inspection(
     inspection_id: uuid.UUID,
@@ -350,6 +461,15 @@ def get_inspection(
                 derived.append(ZoneIssueLabel(zone_key=z["zone_key"], issue_key=iss.get("issue_key", "")))
         reject_labels = [d for d in derived if d.issue_key]
 
+    # Resolve the exact frames behind the rejection (only meaningful when there are flagged zones).
+    flagged_frames: list[FlaggedFrame] = []
+    if reject_labels:
+        raw_sc = (sr.raw_json or {}).get("scoring_config") if sr is not None and isinstance(sr.raw_json, dict) else None
+        max_images = 5
+        if isinstance(raw_sc, dict) and isinstance(raw_sc.get("max_images_per_call"), int):
+            max_images = raw_sc["max_images_per_call"]
+        flagged_frames = _build_flagged_frames(inspection, scoring, reject_labels, max_images)
+
     return InspectionDetail(
         id=inspection.id,
         status=inspection.status,
@@ -367,6 +487,7 @@ def get_inspection(
         reviewed_at=inspection.reviewed_at,
         reject_reason=inspection.reject_reason,
         reject_labels=reject_labels,
+        flagged_frames=flagged_frames,
         scoring=scoring,
         decision_source=agent.decision_source(inspection),
         ocr_plate=inspection.ocr_plate,
@@ -460,17 +581,69 @@ def rerun_analysis(
     return {"ok": True, "status": "pending", "scoring_cleared": len(sr_ids)}
 
 
+def _resolve_appeal(db: Session, inspection: Inspection, prior_reason: str | None) -> dict | None:
+    """Run the independent appeal agent over the latest scoring evidence + active policy. Returns
+    the ruling dict, or None to force a human (kill switch, no evidence, or agent unavailable)."""
+    mv = ensure_active_model_version(db)
+    if mv.mode == "disabled":  # kill switch: never auto-resolve
+        return None
+    sr = db.execute(
+        select(ScoringResult)
+        .where(ScoringResult.inspection_id == inspection.id)
+        .order_by(ScoringResult.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if sr is None:
+        return None
+    zrows = db.execute(select(ZoneScore).where(ZoneScore.scoring_result_id == sr.id)).scalars()
+    scoring = {
+        "overall": sr.overall_score,
+        "zones": [
+            {
+                "zone_key": z.zone_key,
+                "score": z.score,
+                "issues": [
+                    {"issue_key": i.get("issue_key"), "severity": i.get("severity")}
+                    for i in (z.issues or [])
+                ],
+            }
+            for z in zrows
+        ],
+    }
+    eff = scoring_defaults.resolve(mv.scoring_config)
+    policy = {
+        "zone_weight": eff.get("zone_weight"),
+        "severity_cap": eff.get("severity_cap"),
+        "thresholds": (mv.thresholds or {}).get("overall", {}),
+    }
+    return appeal_ai.resolve(scoring, policy, prior_reason)
+
+
+@router.post("/self-heal")
+def self_heal_now(admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Manually trigger the self-healing sweep (also runs automatically in the background):
+    auto-reprocess failed/stuck inspections and re-score any that finished extraction but were
+    never scored. Bounded per inspection so it can never loop."""
+    result = self_heal.run(db)
+    audit.record(
+        db, actor_id=admin.id, action="self_heal_manual", entity="system",
+        entity_id="self_heal", detail=result,
+    )
+    db.commit()
+    return {"ok": True, **result}
+
+
 @router.post("/{inspection_id}/appeal")
 def appeal(
     inspection_id: uuid.UUID,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Driver disputes an automated rejection. Re-opens the inspection for a human reviewer
-    (status -> pending, agent decision cleared) and records the appeal. The dispute outcome the
-    human reaches becomes a gold training label. Only the owning driver may appeal, and only a
-    rejected inspection. Because the auto gate fails safe to human without a calibration curve,
-    a re-opened inspection is not silently re-rejected by the agent."""
+    """Driver disputes an automated rejection. An independent agent re-examines the evidence and
+    self-resolves the appeal: REVERSE (approve), UPHOLD (keep rejected), or ESCALATE to a human
+    (status -> pending) only for genuinely borderline cases. The kill switch (disabled mode) or a
+    missing agent forces the safe path: escalate to a human. Only the owning driver may appeal,
+    and only a rejected inspection."""
     inspection = db.get(Inspection, inspection_id)
     if inspection is None:
         raise HTTPException(status_code=404, detail="Inspection not found")
@@ -481,18 +654,83 @@ def appeal(
 
     prior_reason = inspection.reject_reason
     prior_source = agent.decision_source(inspection)
-    inspection.status = "pending"
-    inspection.reviewed_at = None
-    inspection.reviewed_by = None
-    db.commit()
     audit.record(
         db, actor_id=user.id, action="driver_appeal", entity="inspection",
         entity_id=str(inspection_id),
         detail={"prior_reject_reason": prior_reason, "prior_decided_by": prior_source, "by": "driver"},
     )
     db.commit()
-    logger.info("driver_appeal id=%s driver=%s prior_source=%s", inspection_id, user.id, prior_source)
-    return {"ok": True, "status": "pending"}
+
+    ruling = _resolve_appeal(db, inspection, prior_reason)
+    if ruling is None or ruling["ruling"] == "escalate":
+        # Fall back to a human reviewer.
+        inspection.status = "pending"
+        inspection.reviewed_at = None
+        inspection.reviewed_by = None
+        db.commit()
+        audit.record(
+            db, actor_id=None, action="appeal_escalated", entity="inspection",
+            entity_id=str(inspection_id), detail={"ruling": (ruling or {}).get("ruling", "unavailable")},
+        )
+        db.commit()
+        logger.info("appeal_escalated id=%s driver=%s", inspection_id, user.id)
+        return {"ok": True, "status": "pending", "ruling": "escalate"}
+
+    if ruling["ruling"] == "reverse":
+        inspection.status = "approved"
+        inspection.reject_reason = None
+        title, msg = "Appeal accepted", "Your appeal was reviewed and accepted. The inspection now passes."
+    else:  # uphold
+        inspection.status = "rejected"
+        inspection.reject_reason = ruling["reason"] or prior_reason
+        title, msg = "Appeal reviewed", f"Your appeal was reviewed but the rejection stands: {ruling['reason']}"
+    inspection.reviewed_at = datetime.now(timezone.utc)
+    inspection.reviewed_by = None  # decided by the agent, not a human
+    db.commit()
+    audit.record(
+        db, actor_id=None, action="appeal_auto_resolved", entity="inspection",
+        entity_id=str(inspection_id),
+        detail={"ruling": ruling["ruling"], "confidence": ruling["confidence"], "reason": ruling["reason"][:300]},
+    )
+    db.commit()
+    agent._notify(db, inspection, title, msg)
+    logger.info("appeal_auto_resolved id=%s ruling=%s conf=%.2f", inspection_id, ruling["ruling"], ruling["confidence"])
+    return {"ok": True, "status": inspection.status, "ruling": ruling["ruling"], "reason": ruling["reason"]}
+
+
+@router.post("/{inspection_id}/submit")
+def submit_reclean(
+    inspection_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Finalize a targeted re-clean. A re-clean re-films only the flagged zone group(s), so it
+    may carry a single capture (e.g. interior only). The normal upload-complete path only
+    enqueues extraction once BOTH captures are present, which never happens for a one-group
+    re-clean; the driver app calls this after it has uploaded every re-filmed capture. The worker
+    scores whatever captures a re-clean has (see its relaxed gate). Only for re-inspections."""
+    inspection = db.get(Inspection, inspection_id)
+    if inspection is None:
+        raise HTTPException(status_code=404, detail="Inspection not found")
+    if inspection.driver_id != user.id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not your inspection")
+    if inspection.reinspection_of is None:
+        raise HTTPException(status_code=400, detail="submit is only for re-clean inspections")
+
+    captures = list(
+        db.execute(select(Capture).where(Capture.inspection_id == inspection_id)).scalars()
+    )
+    if not captures:
+        raise HTTPException(status_code=409, detail="Upload at least one re-clean clip first")
+    if inspection.status in ("uploading", "failed"):
+        inspection.status = "processing"
+        db.commit()
+    storage.enqueue_extraction(str(inspection_id))
+    logger.info(
+        "reclean_submitted id=%s driver=%s captures=%s",
+        inspection_id, user.id, [c.kind for c in captures],
+    )
+    return {"ok": True, "status": inspection.status, "captures": [c.kind for c in captures]}
 
 
 @router.get("/{inspection_id}/frames/{frame_id}/url", response_model=FrameUrlResponse)

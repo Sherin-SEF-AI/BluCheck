@@ -83,6 +83,7 @@ export default function RootLayout() {
         <Stack.Screen name="capture" options={{ title: "Record Inspection" }} />
         <Stack.Screen name="upload-status" options={{ title: "Uploads" }} />
         <Stack.Screen name="history" options={{ title: "My Inspections" }} />
+        <Stack.Screen name="rewards" options={{ title: "My Rewards" }} />
       </Stack>
       <ReviewWatcher />
     </>
