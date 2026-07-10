@@ -56,6 +56,14 @@ const ICONS: Record<string, ReactElement> = {
       <circle cx="10" cy="16.5" r="2" />
     </>
   ),
+  // Developers: code brackets.
+  developers: (
+    <>
+      <path d="M8 8l-4 4 4 4" />
+      <path d="M16 8l4 4-4 4" />
+      <path d="M13 6l-2 12" />
+    </>
+  ),
   // Audit: shield with check.
   audit: (
     <>

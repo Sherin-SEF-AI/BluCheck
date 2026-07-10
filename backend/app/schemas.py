@@ -541,6 +541,72 @@ class ReviewRephraseResponse(BaseModel):
     labels: list[ZoneIssueLabel] = []
 
 
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class ApiKeyCreated(BaseModel):
+    id: str
+    name: str
+    key: str  # full plaintext key -- shown ONCE
+    key_prefix: str
+    created_at: datetime
+
+
+class ApiKeyOut(BaseModel):
+    id: str
+    name: str
+    key_prefix: str
+    active: bool
+    created_at: datetime
+    last_used_at: datetime | None = None
+
+
+class ApiKeyList(BaseModel):
+    keys: list[ApiKeyOut] = []
+
+
+class ScoreRequest(BaseModel):
+    images: list[str] = Field(min_length=1, max_length=5)  # base64 or http(s) URLs
+
+
+class ScoreZone(BaseModel):
+    zone_key: str
+    score: float | None
+    issues: list[dict[str, Any]] = []
+
+
+class ScoreResponse(BaseModel):
+    is_vehicle: bool
+    overall_score: float | None
+    decision: str  # "clean" | "dirty" | "review"
+    zones: list[ScoreZone] = []
+
+
+class PublicInspectionItem(BaseModel):
+    id: str
+    plate: str
+    status: str
+    overall_score: float | None = None
+    decision_source: str | None = None
+    created_at: datetime
+
+
+class PublicInspectionList(BaseModel):
+    items: list[PublicInspectionItem] = []
+    total: int
+
+
+class PublicInspectionDetail(BaseModel):
+    id: str
+    plate: str
+    status: str
+    overall_score: float | None = None
+    reject_reason: str | None = None
+    zones: list[ScoreZone] = []
+    created_at: datetime
+
+
 class AssistantMessage(BaseModel):
     role: str
     content: str

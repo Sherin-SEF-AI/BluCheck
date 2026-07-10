@@ -192,6 +192,17 @@ export function review(
   });
 }
 
+// ----- API keys (developer integrations) -----
+export type ApiKey = { id: string; name: string; key_prefix: string; active: boolean; created_at: string; last_used_at: string | null };
+export type ApiKeyCreated = { id: string; name: string; key: string; key_prefix: string; created_at: string };
+export function listApiKeys(): Promise<{ keys: ApiKey[] }> { return request("/apikeys"); }
+export function createApiKey(name: string): Promise<ApiKeyCreated> {
+  return request("/apikeys", { method: "POST", body: JSON.stringify({ name }) });
+}
+export function revokeApiKey(id: string): Promise<{ ok: boolean }> {
+  return request(`/apikeys/${id}`, { method: "DELETE" });
+}
+
 // ----- Agentic admin assistant -----
 export type AssistantMsg = { role: "user" | "assistant"; content: string };
 export type PendingAction = { tool: string; args: Record<string, unknown>; title: string; detail: string };

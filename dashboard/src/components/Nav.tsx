@@ -11,6 +11,7 @@ const LINKS = [
   { href: "/metrics/", label: "Metrics", icon: "metrics" },
   { href: "/model/", label: "Performance", icon: "performance" },
   { href: "/manage/", label: "Manage", icon: "manage" },
+  { href: "/developers/", label: "Developers", icon: "developers" },
   { href: "/audit/", label: "Audit", icon: "audit" },
 ];
 

@@ -148,9 +148,11 @@ from .routers import (  # noqa: E402
     admin,
     auth,
     inspections,
+    apikeys,
     assistant,
     metrics,
     model,
+    public_v1,
     review,
     rewards,
     taxonomy,
@@ -169,3 +171,5 @@ app.include_router(taxonomy.router)
 app.include_router(model.router)
 app.include_router(rewards.router)
 app.include_router(assistant.router)
+app.include_router(apikeys.router)
+app.include_router(public_v1.router)
