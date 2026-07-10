@@ -4,7 +4,7 @@ import Nav from "@/components/Nav";
 import {
   getModelVersion, getPerformance, setMode, setThresholds,
   getScoringConfig, patchScoringConfig, buildCalibration, validateModel, recommendThresholds,
-  generateSop, applySop,
+  generateSop, applySop, getModelHealth, type ModelHealth,
   listPolicies, savePolicy, updatePolicy, deletePolicy, activatePolicy,
   getTuningSuggestion,
   type ModelPerformance, type ModelVersion, type ScoringConfig, type Calibration,
@@ -34,6 +34,7 @@ export default function ModelPage() {
   const [rec, setRec] = useState<RecommendResult | null>(null);
   const [maxFa, setMaxFa] = useState(0.05);
   const [fullAuto, setFullAuto] = useState(false);
+  const [appealAuto, setAppealAuto] = useState(true);
   const [note, setNote] = useState<string | null>(null);
   const [sopText, setSopText] = useState("");
   const [proposal, setProposal] = useState<SopProposal | null>(null);
@@ -44,6 +45,7 @@ export default function ModelPage() {
   const [policyName, setPolicyName] = useState("");
   const [tuning, setTuning] = useState<TuningSuggestion | null>(null);
   const [tuningBusy, setTuningBusy] = useState(false);
+  const [vhealth, setVhealth] = useState<ModelHealth | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -56,9 +58,11 @@ export default function ModelPage() {
       setBlend(Number(sc.effective.blend_mean_weight));
       setMaxImg(Number(sc.effective.max_images_per_call));
       setFullAuto(Boolean((v.thresholds as { full_autonomy?: boolean } | null)?.full_autonomy));
+      setAppealAuto((v.thresholds as { appeal_auto_resolve?: boolean } | null)?.appeal_auto_resolve !== false);
       setActiveSop((sc.stored as { _sop?: string } | null)?._sop ?? null);
       const pl = await listPolicies();
       setPolicies(pl.policies); setActiveId(pl.active_id); setRecommended(pl.recommended);
+      getModelHealth().then(setVhealth).catch(() => undefined);
     } catch (e) { setErr(e instanceof Error ? e.message : "Failed to load"); }
   }, []);
 
@@ -148,6 +152,15 @@ export default function ModelPage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  async function toggleAppealAuto() {
+    const next = !appealAuto;
+    setBusy(true); setErr(null); setNote(null);
+    try {
+      await setThresholds({ ...(mv?.thresholds as Record<string, unknown> ?? {}), appeal_auto_resolve: next });
+      setNote(next ? "Appeals will be auto-resolved by the agent." : "Appeals will be routed to a human with the agent's recommendation.");
+      await load();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Failed"); } finally { setBusy(false); }
+  }
   async function toggleFullAuto() {
     const next = !fullAuto;
     if (next && !window.confirm("Enable FULL AUTONOMY?\n\nEvery inspection will be auto-approved or auto-rejected by the agent with NO human and NO calibration safety net. Uncertain cases are decided (defaulting to reject). The 'Disabled' kill switch still stops everything.")) return;
@@ -211,7 +224,20 @@ export default function ModelPage() {
           <>
             <div className="dim" style={{ marginBottom: 12 }}>
               {perf.model_name ?? mv.vlm_model} · prompt {mv.prompt_version} · current mode <span className={`badge ${mv.mode === "disabled" ? "rejected" : mv.mode === "auto" ? "approved" : "pending"}`}>{mv.mode}</span>
+              {" · vision "}<span className={`badge ${vhealth ? (vhealth.vision_ok ? "approved" : "rejected") : "pending"}`}>{vhealth ? (vhealth.vision_ok ? "healthy" : "DOWN") : "…"}</span>
             </div>
+
+            {vhealth && !vhealth.vision_ok ? (
+              <div className="card" style={{ borderColor: "var(--danger)", background: "rgba(208,67,63,0.06)", marginBottom: 12 }}>
+                <div style={{ fontWeight: 700, color: "var(--text)" }}>⚠ Vision model is failing — scoring may be blocked</div>
+                <div className="dim" style={{ fontSize: 13, marginTop: 4 }}>
+                  Last error{vhealth.last_incident_source ? ` (${vhealth.last_incident_source})` : ""}: <span className="mono">{vhealth.last_incident_message}</span>
+                </div>
+                <div className="dim" style={{ fontSize: 12, marginTop: 6 }}>
+                  Model: <span className="mono">{vhealth.last_incident_model}</span>. Enable it in the Groq console (Allowed Models), then new inspections will score again.
+                </div>
+              </div>
+            ) : null}
 
             <div className="section-title" style={{ marginTop: 0 }}>CLEANLINESS SOP · describe your policy, the agent configures scoring</div>
             <div className="card">
@@ -374,6 +400,18 @@ export default function ModelPage() {
                   : fullAuto
                     ? "Agent decides everything, no human. Uncertain cases default to reject. Kill switch: switch to Disabled."
                     : "Bypass the human/calibration safety net: the agent auto-approves/rejects every inspection."}
+              </span>
+            </div>
+
+            <div className="section-title">APPEALS</div>
+            <div className="filters" style={{ alignItems: "center" }}>
+              <button className={appealAuto ? "" : "ghost"} disabled={busy} onClick={toggleAppealAuto} style={{ minWidth: 160 }}>
+                {appealAuto ? "● Auto-resolve appeals" : "Human-confirm appeals"}
+              </button>
+              <span className="review-hint" style={{ marginTop: 0 }}>
+                {appealAuto
+                  ? "An agent re-examines each appeal and resolves it (uphold / reverse), escalating only borderline cases."
+                  : "Every appeal is routed to a human for review, with the agent's recommended ruling attached."}
               </span>
             </div>
 

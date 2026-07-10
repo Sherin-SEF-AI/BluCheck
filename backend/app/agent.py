@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import agent_brain, audit, calibration, push
+from . import agent_brain, audit, calibration, integrity, push
 from .models import ISSUE_KEYS, Inspection, ModelVersion, ScoringResult, User, Vehicle, ZoneScore
 
 logger = logging.getLogger("blucheck.agent")
@@ -124,6 +124,19 @@ def apply_decision(db: Session, inspection: Inspection, sr: ScoringResult, mv: M
         logger.info("content gate rejected non-vehicle inspection=%s", inspection.id)
         return {"decision": AUTO_REJECT, "reasons": [], "acted": True, "notified": notified, "gate": "not_vehicle"}
 
+    # Fraud / integrity signals (best-effort; never blocks the pipeline). Stored on the inspection
+    # and, when high-risk, used below to hold it for a human instead of auto-approving.
+    integ = None
+    if inspection.status == "pending":
+        try:
+            integ = integrity.check(db, inspection)
+            inspection.integrity = integ
+            db.commit()
+            if integ["risk"] != "low":
+                logger.info("integrity risk=%s inspection=%s reasons=%s", integ["risk"], inspection.id, integ["reasons"])
+        except Exception as err:  # noqa: BLE001 - integrity must never break scoring
+            logger.warning("integrity check failed for %s: %s", inspection.id, err)
+
     # Non-auto modes only observe/recommend (deterministic; no side effects).
     if mv.mode != "auto":
         decision = decide(sr.overall_score, mv.thresholds or {}, mv.mode)
@@ -158,6 +171,11 @@ def apply_decision(db: Session, inspection: Inspection, sr: ScoringResult, mv: M
     # so a possibly-dirty vehicle is re-cleaned rather than passed.
     if full_auto and d == "escalate":
         d = "approve" if (sr.overall_score or 0) >= _full_auto_cutoff(mv.thresholds or {}) else "reject"
+    # High fraud risk overrides an approval: never auto-pass footage that looks reused/staged.
+    if integ and integ.get("risk") == "high" and d == "approve":
+        d = "escalate"
+        reasons = reasons + [{"zone_key": "integrity", "issue_key": "flagged"}]
+        logger.info("integrity HOLD inspection=%s reasons=%s", inspection.id, integ["reasons"])
     acted = False
     if inspection.status == "pending":
         if d == "approve":

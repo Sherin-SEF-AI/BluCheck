@@ -3,7 +3,8 @@ import { useCallback, useEffect, useState } from "react";
 import Nav from "@/components/Nav";
 import {
   getMetrics, getTrends, getOverdue, getCadence, setCadence, runOverdue,
-  type Metrics, type Trends, type OverdueList,
+  getCosts, getDigest, generateDigest,
+  type Metrics, type Trends, type OverdueList, type CostEstimate, type Digest,
 } from "@/lib/api";
 
 function fmtOverdue(h: number | null, never: boolean): string {
@@ -21,6 +22,9 @@ export default function MetricsPage() {
   const [cadence, setCad] = useState<number | "">("");
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [costs, setCosts] = useState<CostEstimate | null>(null);
+  const [digest, setDigest] = useState<Digest | null>(null);
+  const [digestBusy, setDigestBusy] = useState(false);
 
   const loadOverdue = useCallback(async () => {
     try {
@@ -40,7 +44,14 @@ export default function MetricsPage() {
       }
     })();
     loadOverdue();
+    getCosts().then(setCosts).catch(() => undefined);
+    getDigest().then(setDigest).catch(() => undefined);
   }, [loadOverdue]);
+
+  async function makeDigest() {
+    setDigestBusy(true);
+    try { setDigest(await generateDigest()); } catch { /* ignore */ } finally { setDigestBusy(false); }
+  }
 
   async function saveCadence() {
     if (typeof cadence !== "number" || cadence < 1) return;
@@ -88,6 +99,38 @@ export default function MetricsPage() {
               </tbody>
             </table>
           ) : <div className="dim" style={{ marginTop: 10 }}>All vehicles are within the inspection cadence. 🎉</div>}
+        </div>
+
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 320px" }}>
+            <div className="section-title">WEEKLY DIGEST</div>
+            <div className="card">
+              <div className="filters" style={{ marginTop: 0, marginBottom: digest?.text ? 10 : 0 }}>
+                <button className="ghost" disabled={digestBusy} onClick={makeDigest}>{digestBusy ? "Generating…" : "Generate digest"}</button>
+                {digest?.generated_at ? <span className="review-hint" style={{ marginTop: 0 }}>Updated {new Date(digest.generated_at).toLocaleDateString("sv-SE")}{digest.stale ? " · stale" : ""}</span> : null}
+              </div>
+              {digest?.text ? (
+                <div style={{ whiteSpace: "pre-wrap", fontSize: 13.5, lineHeight: 1.55, color: "var(--text)" }}>{digest.text.replace(/\*\*/g, "").replace(/^#+\s*/gm, "")}</div>
+              ) : <div className="dim" style={{ fontSize: 13 }}>No digest yet. It is written automatically each Monday, or generate one now.</div>}
+            </div>
+          </div>
+
+          <div style={{ flex: "1 1 300px" }}>
+            <div className="section-title">ESTIMATED COST · {costs?.period ?? "this month"}</div>
+            <div className="card">
+              {costs ? (
+                <>
+                  <div style={{ fontSize: 30, fontWeight: 800, fontFamily: "var(--mono)", color: "var(--text)" }}>${costs.total_est_usd.toLocaleString()}<span className="dim" style={{ fontSize: 14, fontWeight: 400 }}> /mo est.</span></div>
+                  <table style={{ marginTop: 10 }}><tbody>
+                    <tr><td className="dim">Inference ({costs.images_sent} images, {costs.inference_calls} calls)</td><td className="mono" style={{ textAlign: "right" }}>${costs.inference_usd}</td></tr>
+                    <tr><td className="dim">Storage (~{costs.storage_gb} GB)</td><td className="mono" style={{ textAlign: "right" }}>${costs.storage_usd}</td></tr>
+                    <tr><td className="dim">AWS baseline</td><td className="mono" style={{ textAlign: "right" }}>${costs.aws_baseline_usd}</td></tr>
+                  </tbody></table>
+                  <div className="review-hint" style={{ marginTop: 8 }}>{costs.assumptions.join(" · ")}</div>
+                </>
+              ) : <div className="dim">Loading…</div>}
+            </div>
+          </div>
         </div>
 
         {!metrics ? (

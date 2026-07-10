@@ -195,7 +195,12 @@ export default function InspectionsPage() {
                   <td onClick={(e) => e.stopPropagation()}>
                     <input type="checkbox" checked={selected.has(i.id)} onChange={() => toggle(i.id)} />
                   </td>
-                  <td className="mono">{i.vehicle_plate}</td>
+                  <td className="mono">
+                    {i.vehicle_plate}
+                    {i.integrity_risk && i.integrity_risk !== "low" ? (
+                      <span className={`badge ${i.integrity_risk === "high" ? "rejected" : "pending"}`} title={`${i.integrity_risk} fraud risk`} style={{ marginLeft: 6, fontSize: 10 }}>⚠</span>
+                    ) : null}
+                  </td>
                   <td>{i.driver_name}</td>
                   <td className="mono">{fmt(i.captured_at_utc)}</td>
                   <td><ScoreBar score={i.overall_score} /></td>

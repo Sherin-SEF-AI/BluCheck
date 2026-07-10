@@ -5,20 +5,22 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import agent, audit, push
+from .. import agent, audit, digest_ai, push
 from ..auth import require_admin
 from ..db import get_db
-from ..models import Inspection, Review, ScoringResult, User, Vehicle
+from ..models import AuditLog, Inspection, Review, ScoringResult, User, Vehicle, ZoneScore
 from ..modelcfg import ensure_active_model_version
 from ..schemas import (
     CadenceRequest,
     CadenceResponse,
     ComplianceDriver,
     ComplianceResponse,
+    CostEstimate,
+    DigestResponse,
     MetricsSummary,
     MetricsTrends,
     OverdueResponse,
@@ -145,6 +147,115 @@ def overdue(_admin: User = Depends(require_admin), db: Session = Depends(get_db)
 def run_overdue(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     """Manually trigger the overdue reminder sweep (also runs daily in the background)."""
     return overdue_sweep(db)
+
+
+# Rough unit costs for the estimate (clearly labeled as estimates in the response).
+_VISION_USD_PER_IMAGE = 0.0002   # ~1-2k tokens/image at current vision pricing
+_TEXT_USD_PER_DECISION = 0.0006  # per supervisor/brain text call
+_S3_USD_PER_GB_MONTH = 0.025
+_AVG_INSPECTION_GB = 0.05        # ~2 JPEG clips + selected frames + thumbs
+_MEDIA_RETENTION_DAYS = 3        # media is auto-expired, so live storage ~ last N days
+_AWS_BASELINE_USD = 120.0        # Fargate (api+worker) + RDS + CloudFront + KMS baseline/mo
+
+
+DIGEST_ACTION = "weekly_digest"
+
+
+def _digest_stats(db: Session) -> dict:
+    """Compact stats for the weekly digest: this week's volumes, pass rate, top issues, overdue,
+    fraud flags."""
+    week_start = (datetime.now(IST) - timedelta(days=7)).astimezone(timezone.utc)
+    insps = db.execute(select(Inspection).where(Inspection.created_at >= week_start)).scalars().all()
+    approved = sum(1 for i in insps if i.status == "approved")
+    rejected = sum(1 for i in insps if i.status == "rejected")
+    decided = approved + rejected
+    # Top flagged zones across the week's rejections.
+    zone_counts: dict[str, int] = {}
+    for i in insps:
+        if i.status != "rejected":
+            continue
+        sr = db.execute(select(ScoringResult).where(ScoringResult.inspection_id == i.id).order_by(ScoringResult.created_at.desc()).limit(1)).scalar_one_or_none()
+        if sr:
+            for z in db.execute(select(ZoneScore).where(ZoneScore.scoring_result_id == sr.id)).scalars():
+                if z.issues:
+                    zone_counts[z.zone_key] = zone_counts.get(z.zone_key, 0) + 1
+    _, overdue = _overdue_rows(db)
+    flags = sum(1 for i in insps if isinstance(i.integrity, dict) and i.integrity.get("risk") in ("medium", "high"))
+    return {
+        "total_inspections": len(insps), "approved": approved, "rejected": rejected,
+        "pass_rate_pct": round(100 * approved / decided) if decided else None,
+        "top_flagged_zones": dict(sorted(zone_counts.items(), key=lambda kv: -kv[1])[:4]),
+        "overdue_vehicles": len(overdue), "fraud_flags": flags,
+    }
+
+
+def generate_and_store_digest(db: Session) -> dict:
+    text = digest_ai.generate(_digest_stats(db))
+    if not text:
+        return {"ok": False}
+    now = datetime.now(timezone.utc)
+    audit.record(db, actor_id=None, action=DIGEST_ACTION, entity="fleet", entity_id="weekly",
+                 detail={"text": text, "generated_at": now.isoformat()})
+    db.commit()
+    return {"ok": True, "text": text, "generated_at": now.isoformat()}
+
+
+@router.get("/digest", response_model=DigestResponse)
+def get_digest(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> DigestResponse:
+    """The latest stored weekly digest (generated on a weekly schedule; regenerate via POST)."""
+    last = db.execute(
+        select(AuditLog).where(AuditLog.action == DIGEST_ACTION).order_by(AuditLog.created_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    if last is None:
+        return DigestResponse(text="", generated_at=None, stale=True)
+    detail = last.detail or {}
+    gen_at = last.created_at
+    stale = (datetime.now(timezone.utc) - (gen_at.replace(tzinfo=timezone.utc) if gen_at.tzinfo is None else gen_at)) > timedelta(days=8)
+    return DigestResponse(text=detail.get("text", ""), generated_at=detail.get("generated_at"), stale=stale)
+
+
+@router.post("/digest/generate", response_model=DigestResponse)
+def make_digest(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> DigestResponse:
+    """Generate a fresh weekly digest now."""
+    res = generate_and_store_digest(db)
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail="Could not generate the digest right now; try again.")
+    return DigestResponse(text=res["text"], generated_at=res["generated_at"], stale=False)
+
+
+def estimate_costs(db: Session) -> dict:
+    """Rough monthly cost estimate (inference + storage + AWS baseline). Estimates only."""
+    month_start = datetime.now(IST).replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    srs = db.execute(
+        select(ScoringResult.raw_json).where(ScoringResult.created_at >= month_start)
+    ).scalars().all()
+    calls = len(srs)
+    images = sum(int((r or {}).get("image_count", 0) or 0) for r in srs if isinstance(r, dict))
+    inference_usd = images * _VISION_USD_PER_IMAGE + calls * _TEXT_USD_PER_DECISION
+
+    since = datetime.now(timezone.utc) - timedelta(days=_MEDIA_RETENTION_DAYS)
+    live_insp = db.execute(
+        select(func.count()).select_from(Inspection).where(Inspection.created_at >= since)
+    ).scalar_one()
+    storage_gb = round(live_insp * _AVG_INSPECTION_GB, 2)
+    storage_usd = round(storage_gb * _S3_USD_PER_GB_MONTH, 2)
+    total = round(inference_usd + storage_usd + _AWS_BASELINE_USD, 2)
+    return {
+        "period": "this month",
+        "inference_calls": calls, "images_sent": images, "inference_usd": round(inference_usd, 2),
+        "storage_gb": storage_gb, "storage_usd": storage_usd, "aws_baseline_usd": _AWS_BASELINE_USD,
+        "total_est_usd": total,
+        "assumptions": [
+            f"~${_VISION_USD_PER_IMAGE}/image vision + ~${_TEXT_USD_PER_DECISION}/decision text",
+            f"media kept ~{_MEDIA_RETENTION_DAYS} days at ~{_AVG_INSPECTION_GB}GB/inspection, ${_S3_USD_PER_GB_MONTH}/GB",
+            f"fixed AWS baseline ~${_AWS_BASELINE_USD}/mo (Fargate + RDS + CloudFront)",
+        ],
+    }
+
+
+@router.get("/costs", response_model=CostEstimate)
+def costs(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> CostEstimate:
+    return CostEstimate(**estimate_costs(db))
 
 
 @router.get("/summary", response_model=MetricsSummary)

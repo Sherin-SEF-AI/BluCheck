@@ -116,6 +116,8 @@ async def _start_background_agents() -> None:
         except Exception:  # noqa: BLE001 - a background error must never crash the API
             logger.exception("self_heal sweep failed")
 
+    last_digest_week = {"w": None}
+
     def _overdue() -> None:
         # Run at most once per IST day, at/after the sweep hour.
         now = datetime.now(_IST)
@@ -129,11 +131,26 @@ async def _start_background_agents() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("overdue sweep failed")
 
+    def _weekly_digest() -> None:
+        # Generate the fleet digest once per ISO week (Monday morning IST).
+        now = datetime.now(_IST)
+        wk = now.isocalendar()[:2]  # (year, week)
+        if now.weekday() != 0 or now.hour < OVERDUE_SWEEP_HOUR_IST or last_digest_week["w"] == wk:
+            return
+        try:
+            with SessionLocal() as db:
+                metrics_router.generate_and_store_digest(db)
+            last_digest_week["w"] = wk
+            logger.info("weekly digest generated for %s", wk)
+        except Exception:  # noqa: BLE001
+            logger.exception("weekly digest failed")
+
     async def _loop() -> None:
         while True:
             await asyncio.sleep(SELF_HEAL_INTERVAL_S)
             await asyncio.to_thread(_self_heal)
             await asyncio.to_thread(_overdue)
+            await asyncio.to_thread(_weekly_digest)
 
     asyncio.create_task(_loop())
 

@@ -33,6 +33,7 @@ from ..models import (
     ZoneScore,
 )
 from .. import calibration as calib
+from .. import health as vision_health
 from .. import scoring_defaults, scoring_math, sop as sop_gen, tuning_ai
 from ..schemas import (
     AgentActivityItem,
@@ -60,6 +61,7 @@ from ..schemas import (
     SopProposal,
     TuningEvidence,
     TuningSuggestion,
+    VisionIncidentRequest,
     ValidationReport,
     ZoneIssueLabel,
 )
@@ -135,6 +137,21 @@ def agent_decide(
     if sr is None:
         return {"decision": "none", "acted": False}
     return agent.apply_decision(db, insp, sr, mv)
+
+
+@router.get("/health")
+def model_health(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Vision-model health: whether scoring is currently working, and the last failure if any."""
+    return vision_health.status(db)
+
+
+@router.post("/vision-incident")
+def vision_incident(
+    body: VisionIncidentRequest, _: None = Depends(require_internal), db: Session = Depends(get_db)
+) -> dict:
+    """Internal: the worker reports a vision-model failure here so it surfaces on the dashboard."""
+    vision_health.record_incident(db, body.source, body.model, body.message)
+    return {"ok": True}
 
 
 @router.get("/version", response_model=ModelVersionOut)

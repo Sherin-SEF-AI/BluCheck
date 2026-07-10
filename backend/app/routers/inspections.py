@@ -253,6 +253,7 @@ def list_inspections(
             created_at=insp.created_at,
             decision_source=agent.decision_source(insp),
             overall_score=overall_score,
+            integrity_risk=(insp.integrity or {}).get("risk") if isinstance(insp.integrity, dict) else None,
         )
         for insp, plate, driver_name, overall_score in rows
     ]
@@ -487,6 +488,8 @@ def get_inspection(
         reviewed_at=inspection.reviewed_at,
         reject_reason=inspection.reject_reason,
         reject_labels=reject_labels,
+        integrity=inspection.integrity,
+        appeal_recommendation=(inspection.device_meta or {}).get("appeal_recommendation") if isinstance(inspection.device_meta, dict) else None,
         flagged_frames=flagged_frames,
         scoring=scoring,
         decision_source=agent.decision_source(inspection),
@@ -661,19 +664,29 @@ def appeal(
     )
     db.commit()
 
+    mv = ensure_active_model_version(db)
+    # Appeal mode: auto-resolve (default) applies the agent's ruling; confirm mode routes every
+    # appeal to a human with the agent's ruling attached as a recommendation.
+    auto_resolve = (mv.thresholds or {}).get("appeal_auto_resolve", True)
+
     ruling = _resolve_appeal(db, inspection, prior_reason)
-    if ruling is None or ruling["ruling"] == "escalate":
-        # Fall back to a human reviewer.
+    if ruling is None or ruling["ruling"] == "escalate" or not auto_resolve:
+        # Route to a human reviewer, attaching the agent's recommendation when we have one.
         inspection.status = "pending"
         inspection.reviewed_at = None
         inspection.reviewed_by = None
+        if ruling is not None and ruling["ruling"] != "escalate":
+            dm = dict(inspection.device_meta) if isinstance(inspection.device_meta, dict) else {}
+            dm["appeal_recommendation"] = {"ruling": ruling["ruling"], "reason": ruling["reason"], "confidence": ruling["confidence"]}
+            inspection.device_meta = dm
         db.commit()
         audit.record(
             db, actor_id=None, action="appeal_escalated", entity="inspection",
-            entity_id=str(inspection_id), detail={"ruling": (ruling or {}).get("ruling", "unavailable")},
+            entity_id=str(inspection_id),
+            detail={"ruling": (ruling or {}).get("ruling", "unavailable"), "mode": "confirm" if not auto_resolve else "auto"},
         )
         db.commit()
-        logger.info("appeal_escalated id=%s driver=%s", inspection_id, user.id)
+        logger.info("appeal_escalated id=%s driver=%s auto_resolve=%s", inspection_id, user.id, auto_resolve)
         return {"ok": True, "status": "pending", "ruling": "escalate"}
 
     if ruling["ruling"] == "reverse":

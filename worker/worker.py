@@ -221,6 +221,22 @@ def _internal_token() -> str | None:
         return None
 
 
+def _report_vision_incident(model: str, message: str) -> None:
+    """Best-effort: tell the backend a vision-model call failed, so it shows on dashboard health."""
+    tok = _internal_token()
+    if not tok:
+        return
+    try:
+        requests.post(
+            f"{API_INTERNAL_URL}/model/vision-incident",
+            headers={"Authorization": f"Bearer {tok}"},
+            json={"source": "worker", "model": model, "message": message[:400]},
+            timeout=10,
+        )
+    except requests.RequestException:
+        pass
+
+
 def _delegate_decision(inspection_id: str) -> None:
     """Hand the decision to the backend (the single decision engine, which also sends the
     driver notification). Best-effort: if it fails the inspection stays pending and the
@@ -290,6 +306,10 @@ def run_scoring(db, inspection_id) -> None:
             )
         except ScoringError as e:
             logger.warning("scoring failed inspection=%s: %s (leaving for human)", inspection_id, e)
+            # Surface model-access failures (blocked/rate-limited model) to the dashboard health.
+            msg = str(e).lower()
+            if any(w in msg for w in ("403", "forbidden", "blocked", "429", "rate", "model")):
+                _report_vision_incident(mv.vlm_model or "", str(e))
             return
 
     overall = result.get("overall_score")

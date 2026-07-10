@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import agent, scoring_api
+from .. import agent, health, scoring_api
 from ..apikeys import require_api_key
 from ..db import get_db
 from ..modelcfg import ensure_active_model_version
@@ -42,6 +42,8 @@ def score(
     try:
         out = scoring_api.score(body.images, mv.scoring_config, mv.thresholds, mv.vlm_model)
     except scoring_api.ScoreError as err:
+        if "model call" in str(err):  # a model-access failure, not a bad image
+            health.record_incident(db, "public_score", mv.vlm_model, str(err))
         raise HTTPException(status_code=502, detail=str(err))
     return ScoreResponse(
         is_vehicle=out["is_vehicle"], overall_score=out["overall_score"], decision=out["decision"],

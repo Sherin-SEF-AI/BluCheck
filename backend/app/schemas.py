@@ -236,6 +236,7 @@ class InspectionListItem(BaseModel):
     # Who reached the current status: "agent", "human", or None (not yet decided).
     decision_source: str | None = None
     overall_score: float | None = None
+    integrity_risk: str | None = None  # "low" | "medium" | "high" fraud-signal level
 
 
 class InspectionListResponse(BaseModel):
@@ -262,6 +263,10 @@ class InspectionDetail(BaseModel):
     reviewed_at: datetime | None
     reject_reason: str | None
     reject_labels: list[ZoneIssueLabel] = []
+    # Fraud/integrity result {risk, reasons, signals} computed at decision time.
+    integrity: dict[str, Any] | None = None
+    # In appeal-confirm mode, the agent's recommended ruling for a re-opened appeal.
+    appeal_recommendation: dict[str, Any] | None = None
     # The exact frames a rejection is based on: each detected issue mapped to the analyzed frame
     # that shows it (resolved by capture kind, with a safe fallback). Drives the driver's
     # "clean these" photos.
@@ -529,6 +534,30 @@ class CadenceRequest(BaseModel):
 
 class CadenceResponse(BaseModel):
     cadence_hours: int
+
+
+class CostEstimate(BaseModel):
+    period: str
+    inference_calls: int
+    images_sent: int
+    inference_usd: float
+    storage_gb: float
+    storage_usd: float
+    aws_baseline_usd: float
+    total_est_usd: float
+    assumptions: list[str] = []
+
+
+class DigestResponse(BaseModel):
+    text: str
+    generated_at: str | None = None
+    stale: bool = False
+
+
+class VisionIncidentRequest(BaseModel):
+    source: str
+    model: str | None = None
+    message: str
 
 
 class ReviewRephraseRequest(BaseModel):

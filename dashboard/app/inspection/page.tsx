@@ -273,6 +273,24 @@ function Detail() {
       </div>
       <p className="dim">Driver: {insp.driver_name} &nbsp;|&nbsp; Captured: <span className="mono">{fmt(insp.captured_at_utc)}</span></p>
 
+      {insp.integrity && insp.integrity.risk !== "low" ? (
+        <div className="card" style={{ borderColor: insp.integrity.risk === "high" ? "var(--danger)" : "var(--warn, #d08a1a)", background: insp.integrity.risk === "high" ? "rgba(208,67,63,0.06)" : "rgba(208,138,26,0.06)", marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span className={`badge ${insp.integrity.risk === "high" ? "rejected" : "pending"}`}>⚠ {insp.integrity.risk.toUpperCase()} FRAUD RISK</span>
+            {insp.integrity.risk === "high" ? <span className="dim" style={{ fontSize: 12 }}>Held for human review (not auto-approved).</span> : null}
+          </div>
+          <ul style={{ margin: "8px 0 0", paddingLeft: 20 }}>
+            {insp.integrity.reasons.map((r, i) => <li key={i} style={{ color: "var(--text)", fontSize: 13, marginBottom: 2 }}>{r}</li>)}
+          </ul>
+        </div>
+      ) : null}
+
+      {insp.appeal_recommendation ? (
+        <div className="banner-row agent" style={{ marginBottom: 12 }}>
+          <span>Appeal recommendation: <strong>{insp.appeal_recommendation.ruling.toUpperCase()}</strong> ({Math.round((insp.appeal_recommendation.confidence || 0) * 100)}% conf) &mdash; {insp.appeal_recommendation.reason}</span>
+        </div>
+      ) : null}
+
       {insp.ocr_matched !== null || insp.ocr_plate ? (
         <div
           className="mono"

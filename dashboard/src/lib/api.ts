@@ -68,6 +68,7 @@ export type InspectionListItem = {
   created_at: string;
   decision_source: "agent" | "human" | null;
   overall_score: number | null;
+  integrity_risk: "low" | "medium" | "high" | null;
 };
 export type InspectionList = {
   items: InspectionListItem[];
@@ -117,6 +118,8 @@ export type InspectionDetail = {
   reviewed_at: string | null;
   reject_reason: string | null;
   reject_labels: ZoneIssueLabel[];
+  integrity: { risk: "low" | "medium" | "high"; reasons: string[]; signals?: Record<string, unknown> } | null;
+  appeal_recommendation: { ruling: string; reason: string; confidence: number } | null;
   scoring: ScoringDetail | null;
   decision_source: "agent" | "human" | null;
   ocr_plate: string | null;
@@ -229,6 +232,23 @@ export function setCadence(cadence_hours: number): Promise<{ cadence_hours: numb
 export function runOverdue(): Promise<{ overdue: number; reminded: number; escalated: number; cadence_hours: number }> {
   return request("/metrics/run-overdue", { method: "POST" });
 }
+
+// ----- Observability: model health, costs, weekly digest -----
+export type ModelHealth = {
+  vision_ok: boolean; last_incident_at: string | null; last_incident_model: string | null;
+  last_incident_message: string | null; last_incident_source: string | null; last_success_at: string | null;
+};
+export function getModelHealth(): Promise<ModelHealth> { return request("/model/health"); }
+
+export type CostEstimate = {
+  period: string; inference_calls: number; images_sent: number; inference_usd: number;
+  storage_gb: number; storage_usd: number; aws_baseline_usd: number; total_est_usd: number; assumptions: string[];
+};
+export function getCosts(): Promise<CostEstimate> { return request("/metrics/costs"); }
+
+export type Digest = { text: string; generated_at: string | null; stale: boolean };
+export function getDigest(): Promise<Digest> { return request("/metrics/digest"); }
+export function generateDigest(): Promise<Digest> { return request("/metrics/digest/generate", { method: "POST" }); }
 
 // ----- Self-tuning policy agent -----
 export type TuningEvidence = {

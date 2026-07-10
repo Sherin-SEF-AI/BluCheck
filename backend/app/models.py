@@ -109,6 +109,8 @@ class Inspection(Base):
     # Plate OCR integrity check performed before recording (soft-flagged).
     ocr_plate: Mapped[str | None] = mapped_column(String(32))
     ocr_matched: Mapped[bool | None] = mapped_column(Boolean)
+    # Fraud/integrity result computed at decision time: {risk, reasons, signals}.
+    integrity: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )

@@ -35,10 +35,11 @@ _secrets = boto3.client("secretsmanager", region_name=_settings.aws_region)
 RUNPOD_SECRET_NAME = os.environ.get("RUNPOD_SECRET_NAME", f"{_settings.resource_prefix}/runpod")
 IST = timezone(timedelta(hours=5, minutes=30))
 
-READ_TOOLS = {"fleet_overview", "overdue_vehicles", "model_status", "driver_stats", "recent_inspections", "inspection_lookup"}
+READ_TOOLS = {"fleet_overview", "overdue_vehicles", "model_status", "driver_stats", "recent_inspections", "inspection_lookup", "flagged_inspections", "model_health", "cost_estimate", "weekly_digest"}
 WRITE_TOOLS = {
     "set_cadence", "send_overdue_reminders", "set_mode", "reset_driver_pin", "send_notification",
     "set_thresholds", "activate_policy", "toggle_full_autonomy", "reprocess_inspection", "set_driver_active",
+    "set_appeal_mode", "add_vehicle", "add_driver",
 }
 
 TOOLS = [
@@ -48,6 +49,10 @@ TOOLS = [
     {"type": "function", "function": {"name": "driver_stats", "description": "Look up one driver by car number or name: totals, pass rate, recurring flagged areas.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "recent_inspections", "description": "Recent inspections, optionally filtered by status.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["pending", "approved", "rejected", "failed"]}, "limit": {"type": "integer"}}}}},
     {"type": "function", "function": {"name": "inspection_lookup", "description": "Details of one inspection by its id (use the current inspection id when the admin says 'this inspection') or the latest for a plate.", "parameters": {"type": "object", "properties": {"id": {"type": "string"}, "plate": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "flagged_inspections", "description": "Inspections flagged by the fraud/integrity agent (reused footage, GPS anomaly, rapid resubmission).", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "model_health", "description": "Vision-model health: whether scoring is working now, and the last failure (e.g. a blocked/rate-limited model).", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "cost_estimate", "description": "Rough monthly cost estimate: inference (vision + text), storage, and AWS baseline.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "weekly_digest", "description": "The latest weekly fleet digest text.", "parameters": {"type": "object", "properties": {}}}},
     # ---- write / action tools (proposal only; require confirmation) ----
     {"type": "function", "function": {"name": "set_cadence", "description": "ACTION: set the required inspection cadence in hours.", "parameters": {"type": "object", "properties": {"hours": {"type": "integer", "minimum": 1, "maximum": 8760}}, "required": ["hours"]}}},
     {"type": "function", "function": {"name": "send_overdue_reminders", "description": "ACTION: push a reminder to every overdue driver now.", "parameters": {"type": "object", "properties": {}}}},
@@ -59,6 +64,9 @@ TOOLS = [
     {"type": "function", "function": {"name": "toggle_full_autonomy", "description": "ACTION: turn full autonomy on or off.", "parameters": {"type": "object", "properties": {"on": {"type": "boolean"}}, "required": ["on"]}}},
     {"type": "function", "function": {"name": "reprocess_inspection", "description": "ACTION: reprocess/re-score an inspection by id or latest for a plate.", "parameters": {"type": "object", "properties": {"id": {"type": "string"}, "plate": {"type": "string"}}}}},
     {"type": "function", "function": {"name": "set_driver_active", "description": "ACTION: enable or disable a driver's account by car number.", "parameters": {"type": "object", "properties": {"car_number": {"type": "string"}, "active": {"type": "boolean"}}, "required": ["car_number", "active"]}}},
+    {"type": "function", "function": {"name": "set_appeal_mode", "description": "ACTION: set how driver appeals are handled. auto=agent resolves them; false=route every appeal to a human with the agent's recommendation.", "parameters": {"type": "object", "properties": {"auto": {"type": "boolean"}}, "required": ["auto"]}}},
+    {"type": "function", "function": {"name": "add_vehicle", "description": "ACTION: add a vehicle to the fleet by registration plate.", "parameters": {"type": "object", "properties": {"plate": {"type": "string"}, "model": {"type": "string"}}, "required": ["plate"]}}},
+    {"type": "function", "function": {"name": "add_driver", "description": "ACTION: create a driver account (name + car number). A random 4-digit PIN is generated and returned.", "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "car_number": {"type": "string"}}, "required": ["name", "car_number"]}}},
 ]
 
 SYSTEM = """You are BluCheck's fleet operations assistant for a fleet admin. BluCheck is an
@@ -194,6 +202,36 @@ def _run_read(db: Session, name: str, args: dict) -> dict:
         return _recent_inspections(db, args.get("status"), args.get("limit", 10))
     if name == "inspection_lookup":
         return _inspection_lookup(db, args.get("id"), args.get("plate"))
+    if name == "flagged_inspections":
+        rows = db.execute(
+            select(Inspection).where(Inspection.integrity.isnot(None))
+            .order_by(Inspection.created_at.desc()).limit(60)
+        ).scalars().all()
+        out = []
+        for i in rows:
+            risk = (i.integrity or {}).get("risk")
+            if risk in ("medium", "high"):
+                v = db.get(Vehicle, i.vehicle_id)
+                out.append({"plate": v.registration_plate if v else "?", "status": i.status,
+                            "risk": risk, "reasons": (i.integrity or {}).get("reasons", [])})
+        return {"count": len(out), "flagged": out}
+    if name == "model_health":
+        from . import health as _h
+
+        return _h.status(db)
+    if name == "cost_estimate":
+        from .routers.metrics import estimate_costs
+
+        return estimate_costs(db)
+    if name == "weekly_digest":
+        from .models import AuditLog
+
+        last = db.execute(
+            select(AuditLog).where(AuditLog.action == "weekly_digest").order_by(AuditLog.created_at.desc()).limit(1)
+        ).scalar_one_or_none()
+        if last is None:
+            return {"digest": None, "note": "No weekly digest has been generated yet."}
+        return {"digest": (last.detail or {}).get("text"), "generated_at": (last.detail or {}).get("generated_at")}
     return {"error": f"unknown read tool {name}"}
 
 
@@ -312,6 +350,32 @@ def _run_write(db: Session, name: str, args: dict) -> dict:
         d.active = bool(args.get("active"))
         db.commit()
         return {"ok": True, "message": f"Driver {d.name} ({d.car_number}) {'enabled' if d.active else 'disabled'}."}
+    if name == "set_appeal_mode":
+        mv = ensure_active_model_version(db)
+        auto = bool(args.get("auto"))
+        mv.thresholds = {**(mv.thresholds or {}), "appeal_auto_resolve": auto}
+        db.commit()
+        return {"ok": True, "message": f"Appeals set to {'auto-resolve by the agent' if auto else 'human-confirm'}."}
+    if name == "add_vehicle":
+        plate = (args.get("plate") or "").strip().upper().replace(" ", "")
+        if not plate:
+            return {"ok": False, "message": "A registration plate is required."}
+        if db.execute(select(Vehicle).where(Vehicle.registration_plate == plate)).scalars().first():
+            return {"ok": False, "message": f"Vehicle {plate} already exists."}
+        db.add(Vehicle(registration_plate=plate, model=(args.get("model") or None), active=True))
+        db.commit()
+        return {"ok": True, "message": f"Vehicle {plate} added."}
+    if name == "add_driver":
+        car = (args.get("car_number") or "").strip().upper().replace(" ", "")
+        nm = (args.get("name") or "").strip()
+        if not car or not nm:
+            return {"ok": False, "message": "Name and car number are required."}
+        if db.execute(select(User).where(User.car_number == car)).scalars().first():
+            return {"ok": False, "message": f"A driver with car {car} already exists."}
+        pin = f"{secrets.randbelow(10000):04d}"
+        db.add(User(role="driver", name=nm, car_number=car, password_hash=hash_password(pin), active=True))
+        db.commit()
+        return {"ok": True, "message": f"Driver {nm} ({car}) created. PIN: {pin}"}
     return {"ok": False, "message": f"Unknown action {name}."}
 
 
@@ -345,6 +409,12 @@ def _describe(db: Session, name: str, args: dict) -> dict:
         return {"title": "Reprocess this inspection", "detail": f"Re-runs extraction and scoring for {args.get('id') or args.get('plate')}."}
     if name == "set_driver_active":
         return {"title": f"{'Enable' if args.get('active') else 'Disable'} driver {args.get('car_number')}", "detail": "Controls whether they can sign in."}
+    if name == "set_appeal_mode":
+        return {"title": f"Set appeals to {'auto-resolve' if args.get('auto') else 'human-confirm'}", "detail": "Changes whether the agent resolves appeals or routes them to a human."}
+    if name == "add_vehicle":
+        return {"title": f"Add vehicle {args.get('plate')}", "detail": "Registers a new vehicle in the fleet."}
+    if name == "add_driver":
+        return {"title": f"Add driver {args.get('name')} ({args.get('car_number')})", "detail": "Creates a driver account and generates a login PIN."}
     return {"title": name.replace("_", " "), "detail": ""}
 
 
