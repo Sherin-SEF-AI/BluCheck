@@ -32,8 +32,11 @@ function ReviewWatcher() {
       if (!inited.current) {
         inited.current = true;
         initNotifications().catch(() => undefined);   // permission + push token
-        processQueue().catch(() => undefined);        // resume any interrupted uploads
       }
+      // Re-kick every tick (not just once): resumes uploads that were interrupted, errored, or
+      // stalled on an expired session, once connectivity/auth is back. processQueue is a no-op
+      // when idle or already running, so this is cheap.
+      processQueue().catch(() => undefined);
       const changes = await checkReviewUpdates();
       if (alive && changes.length > 0) setBanner(changes[changes.length - 1]);
     };

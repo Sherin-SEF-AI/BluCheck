@@ -16,11 +16,13 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -267,6 +269,13 @@ class ModelVersion(Base):
     __table_args__ = (
         CheckConstraint(
             "mode IN ('shadow','assist','auto','disabled')", name="ck_model_versions_mode"
+        ),
+        # At most one active model_version (DB-enforced; see 0009_single_active_model).
+        Index(
+            "uq_model_versions_single_active",
+            "active",
+            unique=True,
+            postgresql_where=text("active"),
         ),
     )
 

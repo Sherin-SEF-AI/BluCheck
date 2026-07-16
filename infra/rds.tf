@@ -53,10 +53,11 @@ resource "aws_db_instance" "main" {
   multi_az               = var.db_multi_az
   publicly_accessible    = false
 
-  backup_retention_period = var.db_backup_retention_days
-  deletion_protection     = false
-  skip_final_snapshot     = true
-  apply_immediately       = true
+  backup_retention_period   = var.db_backup_retention_days
+  deletion_protection       = var.db_deletion_protection
+  skip_final_snapshot       = var.db_skip_final_snapshot
+  final_snapshot_identifier = var.db_skip_final_snapshot ? null : "${local.prefix}-final-snapshot"
+  apply_immediately         = true
 
   tags = { Name = "${local.prefix}-db" }
 }

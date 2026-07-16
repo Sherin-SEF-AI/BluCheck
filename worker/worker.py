@@ -23,6 +23,7 @@ import boto3
 import requests
 from botocore.config import Config
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from db import (
     AuditLog,
@@ -349,7 +350,15 @@ def run_scoring(db, inspection_id) -> None:
                 issues=z.get("issues"),
             )
         )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Concurrent delivery: another worker inserted the (inspection, model_version) score
+        # first and the uq_scoring_inspection_model constraint rejected ours. That worker owns
+        # the single decision delegation, so we roll back and return without re-notifying.
+        db.rollback()
+        logger.info("scoring race for inspection=%s: another worker won, skipping", inspection_id)
+        return
     logger.info(
         "scored inspection=%s overall=%s conf=%s latency=%sms", inspection_id, overall, conf, latency
     )

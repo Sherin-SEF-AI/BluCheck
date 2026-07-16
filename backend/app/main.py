@@ -101,13 +101,34 @@ async def _start_background_agents() -> None:
     min) and the daily overdue-inspection sweep. Both are bounded/idempotent and safe on every
     API task."""
     import asyncio
-    from datetime import datetime
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select, text
 
     from .db import SessionLocal
     from . import self_heal
+    from .models import AuditLog
     from .routers import metrics as metrics_router
 
-    last_overdue_day = {"d": None}
+    # Cross-process idempotency: the markers below live in the DB (the audit_log rows each sweep
+    # already writes), not in per-process memory, so running >1 API task cannot double-send. A
+    # Postgres session-level advisory lock serializes the check-then-run so two tasks that tick at
+    # the same instant can't both slip through. Lock keys are arbitrary but stable.
+    _LOCK_OVERDUE = 918_270_001
+    _LOCK_DIGEST = 918_270_002
+
+    def _ran_since(db, action: str, since_utc: datetime) -> bool:
+        return db.execute(
+            select(AuditLog.id)
+            .where(AuditLog.action == action, AuditLog.created_at >= since_utc)
+            .limit(1)
+        ).first() is not None
+
+    def _try_lock(db, key: int) -> bool:
+        return bool(db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar())
+
+    def _unlock(db, key: int) -> None:
+        db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
 
     def _self_heal() -> None:
         try:
@@ -116,32 +137,43 @@ async def _start_background_agents() -> None:
         except Exception:  # noqa: BLE001 - a background error must never crash the API
             logger.exception("self_heal sweep failed")
 
-    last_digest_week = {"w": None}
-
     def _overdue() -> None:
-        # Run at most once per IST day, at/after the sweep hour.
+        # Run at most once per IST day, at/after the sweep hour — DB-gated across all tasks.
         now = datetime.now(_IST)
-        if now.hour < OVERDUE_SWEEP_HOUR_IST or last_overdue_day["d"] == now.date():
+        if now.hour < OVERDUE_SWEEP_HOUR_IST:
             return
+        day_start_utc = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         try:
             with SessionLocal() as db:
-                result = metrics_router.overdue_sweep(db)
-            last_overdue_day["d"] = now.date()
-            logger.info("overdue sweep: %s", result)
+                if not _try_lock(db, _LOCK_OVERDUE):
+                    return  # another task is running the sweep right now
+                try:
+                    if _ran_since(db, "overdue_sweep", day_start_utc):
+                        return
+                    result = metrics_router.overdue_sweep(db)
+                    logger.info("overdue sweep: %s", result)
+                finally:
+                    _unlock(db, _LOCK_OVERDUE)
         except Exception:  # noqa: BLE001
             logger.exception("overdue sweep failed")
 
     def _weekly_digest() -> None:
-        # Generate the fleet digest once per ISO week (Monday morning IST).
+        # Generate the fleet digest once per ISO week (Monday morning IST) — DB-gated across tasks.
         now = datetime.now(_IST)
-        wk = now.isocalendar()[:2]  # (year, week)
-        if now.weekday() != 0 or now.hour < OVERDUE_SWEEP_HOUR_IST or last_digest_week["w"] == wk:
+        if now.weekday() != 0 or now.hour < OVERDUE_SWEEP_HOUR_IST:
             return
+        week_start_utc = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         try:
             with SessionLocal() as db:
-                metrics_router.generate_and_store_digest(db)
-            last_digest_week["w"] = wk
-            logger.info("weekly digest generated for %s", wk)
+                if not _try_lock(db, _LOCK_DIGEST):
+                    return
+                try:
+                    if _ran_since(db, metrics_router.DIGEST_ACTION, week_start_utc):
+                        return
+                    metrics_router.generate_and_store_digest(db)
+                    logger.info("weekly digest generated for week %s", now.isocalendar()[:2])
+                finally:
+                    _unlock(db, _LOCK_DIGEST)
         except Exception:  # noqa: BLE001
             logger.exception("weekly digest failed")
 

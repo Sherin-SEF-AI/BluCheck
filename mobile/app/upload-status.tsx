@@ -3,6 +3,8 @@ import { View, Text, FlatList, Pressable, StyleSheet, ActivityIndicator, Refresh
 import { router } from "expo-router";
 import {
   getQueue,
+  getAnalyzable,
+  clearAnalyzable,
   processQueue,
   cancelItem,
   setProgressListener,
@@ -97,13 +99,18 @@ export default function UploadStatus() {
   const [busy, setBusy] = useState(false);
   // Live progress keyed by inspectionId-kind.
   const [progress, setProgress] = useState<Record<string, UploadProgress>>({});
+  // Inspections whose uploads are all delivered (persisted; survives the queue-item cleanup).
+  const [readyIds, setReadyIds] = useState<string[]>([]);
   // Server-side analysis state keyed by inspectionId, once its uploads are all done.
   const [analysis, setAnalysis] = useState<Record<string, InspectionDetail>>({});
   const analysisRef = useRef<Record<string, InspectionDetail>>({});
   const startedRef = useRef(false);
+  const online = useOnline();
+  const wasOnline = useRef(online);
 
   const refresh = useCallback(async () => {
     setItems(await getQueue());
+    setReadyIds(await getAnalyzable());
   }, []);
 
   useEffect(() => {
@@ -123,14 +130,17 @@ export default function UploadStatus() {
     };
   }, [refresh]);
 
-  // Once both captures of an inspection have finished uploading, follow its analysis on the
-  // server (processing -> scored -> approved/rejected) and show it live. Stops at a result.
+  // Auto-resume the moment connectivity returns (offline -> online transition).
   useEffect(() => {
-    const byId: Record<string, QueueItem[]> = {};
-    for (const it of items) (byId[it.inspectionId] ||= []).push(it);
-    const readyIds = Object.keys(byId).filter(
-      (id) => byId[id].length > 0 && byId[id].every((i) => i.status === "completed")
-    );
+    if (online && !wasOnline.current) {
+      processQueue().catch(() => undefined).finally(refresh);
+    }
+    wasOnline.current = online;
+  }, [online, refresh]);
+
+  // For every inspection whose uploads are all delivered, follow its analysis on the server
+  // (processing -> scored -> approved/rejected) and show it live. Stops (and forgets it) at a result.
+  useEffect(() => {
     if (readyIds.length === 0) return;
 
     let cancelled = false;
@@ -143,6 +153,7 @@ export default function UploadStatus() {
           if (cancelled) return;
           analysisRef.current = { ...analysisRef.current, [id]: d };
           setAnalysis(analysisRef.current);
+          if (TERMINAL.includes(d.status)) clearAnalyzable(id).catch(() => undefined);
         } catch {
           /* transient; keep polling */
         }
@@ -154,7 +165,7 @@ export default function UploadStatus() {
       cancelled = true;
       clearInterval(t);
     };
-  }, [items]);
+  }, [readyIds]);
 
   async function retryAll() {
     setBusy(true);
@@ -175,7 +186,6 @@ export default function UploadStatus() {
   }
 
   const anyPending = items.some((i) => i.status !== "completed");
-  const online = useOnline();
 
   return (
     <View style={styles.container}>

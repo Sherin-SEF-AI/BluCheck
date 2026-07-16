@@ -48,6 +48,10 @@ export type UploadProgress = {
 };
 
 const QUEUE_PATH = `${FileSystem.documentDirectory}blucheck-upload-queue.json`;
+// Inspections whose every captured clip has finished uploading. Tracked separately from the queue
+// because completed queue items are dropped (and their clips deleted) as soon as they upload — so
+// the Uploads screen can follow server-side analysis without racing that cleanup.
+const ANALYZE_PATH = `${FileSystem.documentDirectory}blucheck-analyze.json`;
 
 // ---- Live progress emitter (UI subscribes; not persisted) ----
 let progressListener: ((p: UploadProgress) => void) | null = null;
@@ -92,6 +96,37 @@ async function deleteClip(uri: string): Promise<void> {
 
 export async function getQueue(): Promise<QueueItem[]> {
   return readQueue();
+}
+
+async function readAnalyze(): Promise<string[]> {
+  const info = await FileSystem.getInfoAsync(ANALYZE_PATH);
+  if (!info.exists) return [];
+  try {
+    return JSON.parse(await FileSystem.readAsStringAsync(ANALYZE_PATH)) as string[];
+  } catch {
+    return [];
+  }
+}
+
+async function writeAnalyze(ids: string[]): Promise<void> {
+  // Keep the list bounded so it can't grow without limit across many inspections.
+  const tmp = `${ANALYZE_PATH}.tmp`;
+  await FileSystem.writeAsStringAsync(tmp, JSON.stringify(ids.slice(-20)));
+  await FileSystem.moveAsync({ from: tmp, to: ANALYZE_PATH });
+}
+
+// Inspection ids whose uploads are all delivered — the UI follows their server-side analysis.
+export async function getAnalyzable(): Promise<string[]> {
+  return readAnalyze();
+}
+
+// Drop an inspection from the tracker once its analysis has reached a terminal result.
+export async function clearAnalyzable(inspectionId: string): Promise<void> {
+  await withQueueLock(async () => {
+    const ids = await readAnalyze();
+    const next = ids.filter((x) => x !== inspectionId);
+    if (next.length !== ids.length) await writeAnalyze(next);
+  });
 }
 
 export async function pendingCount(): Promise<number> {
@@ -310,6 +345,24 @@ export async function processQueue(): Promise<void> {
       const all = await readQueue();
       const done = all.filter((i) => i.status === "completed" || i.status === "dead");
       const remaining = all.filter((i) => i.status !== "completed" && i.status !== "dead");
+
+      // Record inspections whose EVERY queued clip uploaded successfully, so the UI can follow
+      // their analysis after these completed items (and their clips) are removed below.
+      const byInsp = new Map<string, QueueItem[]>();
+      for (const i of all) {
+        const list = byInsp.get(i.inspectionId) ?? [];
+        list.push(i);
+        byInsp.set(i.inspectionId, list);
+      }
+      const ready: string[] = [];
+      for (const [id, its] of byInsp) {
+        if (its.length > 0 && its.every((i) => i.status === "completed")) ready.push(id);
+      }
+      if (ready.length) {
+        const prev = await readAnalyze();
+        await writeAnalyze([...new Set([...prev, ...ready])]);
+      }
+
       await writeQueue(remaining);
       for (const i of done) await deleteClip(i.videoUri);
     });

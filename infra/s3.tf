@@ -38,11 +38,14 @@ resource "aws_s3_bucket_versioning" "media" {
 resource "aws_s3_bucket_cors_configuration" "media" {
   bucket = aws_s3_bucket.media.id
 
-  # Allows the mobile client to PUT multipart parts directly to presigned URLs.
+  # Scoped to the dashboard origin. The native mobile client's presigned PUTs are not browser
+  # requests (they carry no Origin header), so S3 does not apply CORS to them — restricting the
+  # allowed origins here does not affect mobile uploads, but it stops any arbitrary web origin from
+  # driving the presigned upload/download flow. The dashboard (browser) fetches annotated frames.
   cors_rule {
     allowed_headers = ["*"]
     allowed_methods = ["PUT", "GET", "HEAD"]
-    allowed_origins = ["*"]
+    allowed_origins = ["https://${aws_cloudfront_distribution.dashboard.domain_name}"]
     expose_headers  = ["ETag"]
     max_age_seconds = 3000
   }

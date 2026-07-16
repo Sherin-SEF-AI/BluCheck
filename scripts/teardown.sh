@@ -28,6 +28,10 @@ for out in media_bucket dashboard_bucket; do
 done
 
 log "terraform destroy"
-terraform -chdir="$INFRA_DIR" destroy -auto-approve
+# The DB is deletion-protected and takes a final snapshot by default (production-safe); disable
+# both for teardown so destroy can actually remove it.
+terraform -chdir="$INFRA_DIR" destroy -auto-approve \
+  -var 'db_deletion_protection=false' \
+  -var 'db_skip_final_snapshot=true'
 
 log "teardown complete. No billable BluCheck resources remain."

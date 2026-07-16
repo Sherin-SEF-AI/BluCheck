@@ -9,9 +9,12 @@ math so the public API agrees with the fleet's own decisions. Raises ScoreError 
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import logging
 import os
+import socket
+from urllib.parse import urlparse
 
 import boto3
 import requests
@@ -83,12 +86,37 @@ def _cfg() -> dict:
     return data
 
 
+def _assert_public_url(url: str) -> None:
+    """SSRF guard: reject URLs that resolve to a non-public address (loopback, private, link-local,
+    the cloud metadata endpoint, etc.). Every resolved IP for the host must be global — so a hostname
+    that resolves to a mix of public and internal addresses is refused, not just the first result."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ScoreError("image URL must be http(s)")
+    host = parsed.hostname
+    if not host:
+        raise ScoreError("image URL has no host")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except OSError as err:
+        raise ScoreError(f"could not resolve image host: {err}") from err
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global or ip.is_reserved:
+            raise ScoreError("image URL resolves to a non-public address")
+
+
 def _to_b64(image: str) -> str:
     """Accept a base64 string (optionally a data: URL) or fetch an http(s) URL and return base64."""
     s = image.strip()
     if s.startswith("http://") or s.startswith("https://"):
-        # A browser-like UA so common image hosts/CDNs don't 403 the default client.
-        r = requests.get(s, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; BluCheck/1.0)"})
+        _assert_public_url(s)
+        # A browser-like UA so common image hosts/CDNs don't 403 the default client. Redirects are
+        # disabled so a public URL cannot 30x-bounce us into an internal address after the check.
+        r = requests.get(
+            s, timeout=15, allow_redirects=False,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; BluCheck/1.0)"},
+        )
         r.raise_for_status()
         return base64.b64encode(r.content).decode("ascii")
     if s.startswith("data:"):
@@ -129,7 +157,9 @@ def score(images: list[str], scoring_config: dict | None, thresholds: dict | Non
     except Exception as err:  # noqa: BLE001
         raise ScoreError(f"scoring failed: {err}") from err
 
-    is_vehicle = bool(raw.get("is_vehicle", True))
+    # Fail-safe: is_vehicle is a required schema field, so a missing value is malformed output;
+    # default it to False rather than scoring unverified content as a vehicle.
+    is_vehicle = bool(raw.get("is_vehicle", False))
     scfg = scoring_defaults.resolve(scoring_config)
     if not is_vehicle:
         return {"is_vehicle": False, "overall_score": None, "decision": "review", "zones": []}
