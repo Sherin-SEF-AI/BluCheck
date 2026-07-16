@@ -6,6 +6,7 @@ runtime without a redeploy. Defaults to shadow so nothing auto-acts on deploy.
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .models import ModelVersion
@@ -20,10 +21,18 @@ DEFAULT_VLM = "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
 DEFAULT_PROMPT_VERSION = "v1"
 
 
+def _active(db: Session) -> ModelVersion | None:
+    # first() (not scalar_one_or_none) so a legacy pre-index duplicate can't 500 the whole
+    # platform with MultipleResultsFound; the partial-unique index prevents new duplicates.
+    return db.execute(
+        select(ModelVersion)
+        .where(ModelVersion.active.is_(True))
+        .order_by(ModelVersion.created_at.asc())
+    ).scalars().first()
+
+
 def ensure_active_model_version(db: Session) -> ModelVersion:
-    mv = db.execute(
-        select(ModelVersion).where(ModelVersion.active.is_(True))
-    ).scalar_one_or_none()
+    mv = _active(db)
     if mv is not None:
         return mv
     mv = ModelVersion(
@@ -35,6 +44,15 @@ def ensure_active_model_version(db: Session) -> ModelVersion:
         active=True,
     )
     db.add(mv)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent first-request created the active row first; the partial-unique index
+        # rejected ours. Roll back and return the winner instead of crashing.
+        db.rollback()
+        existing = _active(db)
+        if existing is None:  # pragma: no cover - lost the row between rollback and re-read
+            raise
+        return existing
     db.refresh(mv)
     return mv

@@ -59,10 +59,12 @@ def _pin_fail(car: str) -> None:
 
 @router.post("/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
 def register(body: RegisterRequest, db: Session = Depends(get_db)) -> LoginResponse:
-    """Driver self-onboarding: name + car number + 4-digit PIN. Creates the driver and, if
-    needed, their vehicle. The car number is the identity (scanned at login); the PIN is the
-    secret. Trust-on-first-registration: a car number can be claimed once and cannot be
-    re-registered, so an attacker cannot reset an existing driver's PIN.
+    """Driver self-onboarding: name + car number + 4-digit PIN. The driver claims a vehicle the
+    operator has already provisioned (admin POST /vehicles); the car number is the identity
+    (scanned at login) and the PIN is the secret. Trust-on-first-registration: a car number can be
+    claimed once and cannot be re-registered, so an attacker cannot reset an existing driver's PIN.
+    Registration is restricted to known fleet plates so an attacker cannot squat an arbitrary or
+    not-yet-onboarded plate by self-creating its vehicle record.
     """
     car = _norm_plate(body.car_number)
     if db.execute(select(User).where(User.car_number == car)).scalar_one_or_none():
@@ -71,11 +73,12 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)) -> LoginRespo
     vehicle = db.execute(
         select(Vehicle).where(Vehicle.registration_plate == car)
     ).scalar_one_or_none()
-    if vehicle is None:
-        vehicle = Vehicle(registration_plate=car, model=None, active=True)
-        db.add(vehicle)
-    else:
-        vehicle.active = True
+    if vehicle is None or not vehicle.active:
+        # Do NOT auto-create the vehicle: only operator-provisioned fleet vehicles can be claimed.
+        raise HTTPException(
+            status_code=404,
+            detail="This car is not registered to the fleet. Contact your operator.",
+        )
 
     user = User(
         role="driver",
@@ -102,14 +105,24 @@ def login(body: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
     if not identifier:
         raise HTTPException(status_code=422, detail="Provide car number or email")
     car = _norm_plate(identifier)
+    # Same brute-force lockout as /pin-login, keyed by identifier. Without this, a driver's
+    # 4-digit PIN (their password_hash) could be enumerated here even though /pin-login is locked.
+    lock_key = identifier.lower()
+    if _pin_locked(lock_key):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many attempts. Please wait a few minutes and try again.",
+        )
     user = db.execute(
         select(User).where(
             or_(User.email == identifier.lower(), User.car_number == car)
         )
     ).scalar_one_or_none()
     if user is None or not user.active or not verify_password(body.password, user.password_hash):
+        _pin_fail(lock_key)
         logger.info("login_failed id=%s", identifier)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    _PIN_FAILS.pop(lock_key, None)
     token = create_access_token(user)
     logger.info("login_ok user_id=%s role=%s", user.id, user.role)
     return LoginResponse(access_token=token, role=user.role, name=user.name, car_number=user.car_number)

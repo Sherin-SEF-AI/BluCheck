@@ -136,6 +136,18 @@ def create_inspection(
     if vehicle is None or not vehicle.active:
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
+    # A reclean must reference a real, previously-rejected inspection owned by THIS driver.
+    # Without this check a client can (a) 500 the API with a random UUID (FK violation) or
+    # (b) point at another driver's inspection and later read back its reject_reason.
+    if body.reinspection_of is not None:
+        prior = db.get(Inspection, body.reinspection_of)
+        if prior is None or prior.driver_id != user.id:
+            raise HTTPException(status_code=404, detail="Original inspection not found")
+        if prior.status != "rejected":
+            raise HTTPException(
+                status_code=409, detail="Only a rejected inspection can be re-cleaned"
+            )
+
     inspection = Inspection(
         vehicle_id=body.vehicle_id,
         driver_id=user.id,
@@ -497,7 +509,7 @@ def get_inspection(
         ocr_matched=inspection.ocr_matched,
         reinspection_of=inspection.reinspection_of,
         reinspection_of_reason=(
-            db.get(Inspection, inspection.reinspection_of).reject_reason
+            (prior_insp.reject_reason if (prior_insp := db.get(Inspection, inspection.reinspection_of)) else None)
             if inspection.reinspection_of
             else None
         ),
@@ -667,10 +679,21 @@ def appeal(
     mv = ensure_active_model_version(db)
     # Appeal mode: auto-resolve (default) applies the agent's ruling; confirm mode routes every
     # appeal to a human with the agent's ruling attached as a recommendation.
-    auto_resolve = (mv.thresholds or {}).get("appeal_auto_resolve", True)
+    # The kill switch is absolute: in 'disabled' mode the agent never self-resolves an appeal.
+    disabled = mv.mode == "disabled"
+    auto_resolve = (mv.thresholds or {}).get("appeal_auto_resolve", True) and not disabled
+    # Auto-REVERSE (overturning a rejection with no human) is the risky direction: gate it on a
+    # confidence floor so a weak ruling routes to a human instead of auto-approving. Auto-UPHOLD
+    # keeps the existing rejection and is always safe.
+    appeal_min_conf = float((mv.thresholds or {}).get("appeal_min_confidence", 0.8))
 
     ruling = _resolve_appeal(db, inspection, prior_reason)
-    if ruling is None or ruling["ruling"] == "escalate" or not auto_resolve:
+    low_conf_reverse = (
+        ruling is not None
+        and ruling["ruling"] == "reverse"
+        and (ruling.get("confidence") or 0) < appeal_min_conf
+    )
+    if ruling is None or ruling["ruling"] == "escalate" or not auto_resolve or low_conf_reverse:
         # Route to a human reviewer, attaching the agent's recommendation when we have one.
         inspection.status = "pending"
         inspection.reviewed_at = None
@@ -680,10 +703,16 @@ def appeal(
             dm["appeal_recommendation"] = {"ruling": ruling["ruling"], "reason": ruling["reason"], "confidence": ruling["confidence"]}
             inspection.device_meta = dm
         db.commit()
+        cause = (
+            "disabled" if disabled
+            else "low_confidence_reverse" if low_conf_reverse
+            else "confirm" if not auto_resolve
+            else "agent_escalate"
+        )
         audit.record(
             db, actor_id=None, action="appeal_escalated", entity="inspection",
             entity_id=str(inspection_id),
-            detail={"ruling": (ruling or {}).get("ruling", "unavailable"), "mode": "confirm" if not auto_resolve else "auto"},
+            detail={"ruling": (ruling or {}).get("ruling", "unavailable"), "cause": cause},
         )
         db.commit()
         logger.info("appeal_escalated id=%s driver=%s auto_resolve=%s", inspection_id, user.id, auto_resolve)

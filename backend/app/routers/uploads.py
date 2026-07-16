@@ -35,12 +35,25 @@ _settings = get_settings()
 KIND_PATH = Path(pattern="^(exterior|interior)$")
 
 
-def _owned_inspection(inspection_id: uuid.UUID, user: User, db: Session) -> Inspection:
+# Capture rows may only be created/overwritten while the inspection is still being uploaded
+# or is (re)processing. Once it has been scored ("pending") or decided ("approved"/"rejected"),
+# accepting a new clip would overwrite the media a decision was made on.
+_MUTABLE_UPLOAD_STATES = {"uploading", "failed", "processing"}
+
+
+def _owned_inspection(
+    inspection_id: uuid.UUID, user: User, db: Session, *, require_mutable: bool = False
+) -> Inspection:
     inspection = db.get(Inspection, inspection_id)
     if inspection is None:
         raise HTTPException(status_code=404, detail="Inspection not found")
     if user.role != "driver" or inspection.driver_id != user.id:
         raise HTTPException(status_code=403, detail="Not your inspection")
+    if require_mutable and inspection.status not in _MUTABLE_UPLOAD_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Inspection is already {inspection.status}; start a new inspection",
+        )
     return inspection
 
 
@@ -54,7 +67,7 @@ def create_upload_url(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UploadUrlResponse:
-    _owned_inspection(inspection_id, user, db)
+    _owned_inspection(inspection_id, user, db, require_mutable=True)
     key = storage.raw_key(str(inspection_id), kind)
 
     # Resume path: reuse the caller's upload id, or an existing in-progress upload.
@@ -88,7 +101,7 @@ def complete_upload(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CompleteUploadResponse:
-    inspection = _owned_inspection(inspection_id, user, db)
+    inspection = _owned_inspection(inspection_id, user, db, require_mutable=True)
     key = storage.raw_key(str(inspection_id), kind)
 
     storage.complete_multipart(

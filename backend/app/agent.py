@@ -106,9 +106,11 @@ def apply_decision(db: Session, inspection: Inspection, sr: ScoringResult, mv: M
     reasons = zone_reasons(sr.id, db)
 
     # Content gate: the scorer determined the frames are not a vehicle (a room, a person, random
-    # footage). This is invalid input, not a cleanliness judgment, so it is rejected in EVERY mode
-    # (even shadow) -- cleanliness is only ever analysed on an actual vehicle.
-    if (sr.raw_json or {}).get("not_vehicle") and inspection.status == "pending":
+    # footage). This is invalid input, not a cleanliness judgment. The agent only takes the
+    # terminal auto-reject in 'auto' mode; in 'shadow'/'assist'/'disabled' it does not act here --
+    # the kill switch stays absolute and humans decide -- so the non-vehicle simply routes to a
+    # human below (overall_score is None -> ROUTE_HUMAN).
+    if (sr.raw_json or {}).get("not_vehicle") and inspection.status == "pending" and mv.mode == "auto":
         now = datetime.now(timezone.utc)
         sr.decision = AUTO_REJECT
         inspection.status, inspection.reviewed_at, inspection.reviewed_by = "rejected", now, None
@@ -166,11 +168,11 @@ def apply_decision(db: Session, inspection: Inspection, sr: ScoringResult, mv: M
 
     now = datetime.now(timezone.utc)
     d = brain["decision"]
-    # Full autonomy: an "escalate" must become terminal. Split on the single cutoff (midpoint of
-    # the bands, or thresholds.overall.full_auto_cutoff), defaulting an ambiguous case to reject
-    # so a possibly-dirty vehicle is re-cleaned rather than passed.
+    # Full autonomy: an "escalate" must become terminal, and an uncertain case defaults to REJECT
+    # (re-clean) -- never auto-approve something the agent itself flagged as ambiguous. This is the
+    # documented "uncertain -> reject" guarantee: a possibly-dirty vehicle is re-cleaned, not passed.
     if full_auto and d == "escalate":
-        d = "approve" if (sr.overall_score or 0) >= _full_auto_cutoff(mv.thresholds or {}) else "reject"
+        d = "reject"
     # High fraud risk overrides an approval: never auto-pass footage that looks reused/staged.
     if integ and integ.get("risk") == "high" and d == "approve":
         d = "escalate"
@@ -258,23 +260,14 @@ def _calibration_gate(db: Session, inspection: Inspection, sr: ScoringResult, mv
             "gate": reason}
 
 
-def _full_auto_cutoff(thresholds: dict) -> float:
-    """Single approve/reject cutoff for Full Autonomy: an explicit override, else the midpoint of
-    the auto-approve / auto-reject bands."""
-    ov = (thresholds or {}).get("overall", {})
-    if isinstance(ov.get("full_auto_cutoff"), (int, float)):
-        return float(ov["full_auto_cutoff"])
-    return (ov.get("auto_approve", 85) + ov.get("auto_reject", 40)) / 2
-
-
 def _apply_threshold(db: Session, inspection: Inspection, sr: ScoringResult, mv: ModelVersion,
                      reasons: list[dict], force_terminal: bool = False) -> dict:
     """Deterministic fallback used when the supervisor agent is unavailable. When force_terminal
-    (Full Autonomy), an in-between score can't route to a human: it is split on the single cutoff
-    into approve/reject."""
+    (Full Autonomy), an in-between score can't route to a human: an uncertain (route-human) score
+    defaults to REJECT (re-clean), matching the 'uncertain -> reject' safety guarantee."""
     decision = decide(sr.overall_score, mv.thresholds or {}, "auto")
     if force_terminal and decision == ROUTE_HUMAN:
-        decision = AUTO_APPROVE if (sr.overall_score or 0) >= _full_auto_cutoff(mv.thresholds or {}) else AUTO_REJECT
+        decision = AUTO_REJECT
     sr.decision = decision
     db.add(sr)
     acted = False

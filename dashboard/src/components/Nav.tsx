@@ -8,6 +8,7 @@ const LINKS = [
   { href: "/", label: "Agent", icon: "agent" },
   { href: "/inspections/", label: "Queue", icon: "queue" },
   { href: "/fleet/", label: "Fleet", icon: "fleet" },
+  { href: "/compliance/", label: "Compliance", icon: "compliance" },
   { href: "/metrics/", label: "Metrics", icon: "metrics" },
   { href: "/model/", label: "Performance", icon: "performance" },
   { href: "/manage/", label: "Manage", icon: "manage" },

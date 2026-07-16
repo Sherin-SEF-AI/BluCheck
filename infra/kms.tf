@@ -35,6 +35,23 @@ resource "aws_kms_key" "main" {
           }
         }
       },
+      {
+        # CloudWatch alarms publish to the SSE-KMS-encrypted SNS alarm topic; without this the
+        # publish fails and DLQ / 5xx notifications silently never deliver.
+        Sid       = "AllowCloudWatchAlarmsToUseKey"
+        Effect    = "Allow"
+        Principal = { Service = "cloudwatch.amazonaws.com" }
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey*",
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = local.account_id
+          }
+        }
+      },
     ]
   })
 

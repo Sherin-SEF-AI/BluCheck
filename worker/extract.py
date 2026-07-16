@@ -194,4 +194,10 @@ def _write_metadata(
         return
 
     args.append(str(image_path))
-    _run(args)
+    # Metadata is a best-effort provenance stamp, not the frame itself. A failure here
+    # (exiftool missing, unwritable tag) must NOT abort an otherwise-successful extraction
+    # and send the capture to the DLQ — the frames are already on disk and usable.
+    try:
+        _run(args)
+    except ExtractionError as err:
+        logger.warning("metadata embed failed for %s: %s (continuing)", image_path.name, err)

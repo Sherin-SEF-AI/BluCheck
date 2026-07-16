@@ -35,9 +35,21 @@ variable "db_multi_az" {
 }
 
 variable "db_backup_retention_days" {
-  description = "RDS automated backup retention. 0 for free-tier accounts; raise to 7+ for production."
+  description = "RDS automated backup retention in days. Set to 0 only on throwaway/free-tier stacks."
   type        = number
-  default     = 0
+  default     = 7
+}
+
+variable "db_deletion_protection" {
+  description = "Block accidental deletion of the database. Keep true in production; teardown sets false."
+  type        = bool
+  default     = true
+}
+
+variable "db_skip_final_snapshot" {
+  description = "Skip the final snapshot on delete. Keep false in production so a destroy still leaves a backup."
+  type        = bool
+  default     = false
 }
 
 variable "db_name" {

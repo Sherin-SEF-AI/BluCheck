@@ -151,9 +151,10 @@ def _sanitize(result: dict) -> dict:
         cz["issues"] = issues
         zones.append(cz)
     return {
-        # Default True (fail-open): only an explicit False from the model rejects the content, so
-        # a missing field never false-rejects a real car.
-        "is_vehicle": bool(result.get("is_vehicle", True)),
+        # Default False (fail-safe): is_vehicle is a required schema field, so a missing value means
+        # malformed output -- treat that as "not verified to be a vehicle" rather than waving it
+        # through. A real car returns an explicit True.
+        "is_vehicle": bool(result.get("is_vehicle", False)),
         "reasoning": result.get("reasoning") if isinstance(result.get("reasoning"), str) else "",
         "overall_score": result.get("overall_score"),
         "overall_confidence": result.get("overall_confidence"),
@@ -422,15 +423,18 @@ def score_frames(
         flat_ids += ids
         idx += len(ps)
 
-    # Content gate: if NO capture looked like a vehicle, this is not a car (a room, a person,
-    # scenery...). Do not score cleanliness -- return a not_vehicle result the decision layer
-    # turns into a rejection. Checked before "no zones" so non-car uploads never stall.
-    if vehicle_votes and not any(vehicle_votes):
-        logger.info("content gate: frames are not a vehicle; rejecting without cleanliness score")
+    # Content gate: if ANY required capture does not show a vehicle (a room, a person, scenery, or
+    # mismatched footage), the inspection does not fully show the car. Do not score cleanliness --
+    # return a not_vehicle result the decision layer turns into a rejection. Rejecting on any
+    # non-vehicle capture (not only when all of them are) closes the mixed-upload hole where a real
+    # exterior is paired with non-vehicle interior footage. Checked before "no zones" so it can't stall.
+    if vehicle_votes and not all(vehicle_votes):
+        logger.info("content gate: a capture is not a vehicle; rejecting without cleanliness score")
         result = {
             "is_vehicle": False, "not_vehicle": True,
             "overall_score": None, "overall_confidence": None, "zones": [],
-            "reasoning": " | ".join(r for r in reasons if r)[:500] or "Frames do not show a vehicle.",
+            "reasoning": " | ".join(r for r in reasons if r)[:500]
+            or "One or more clips do not clearly show the vehicle.",
         }
         stats = {"image_count": image_count, "scoring_config": scfg, "not_vehicle": True, "per_frame": per_frame}
         return result, int((time.time() - started) * 1000), stats

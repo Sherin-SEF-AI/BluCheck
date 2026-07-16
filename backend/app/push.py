@@ -24,7 +24,10 @@ import requests
 logger = logging.getLogger("blucheck.push")
 
 EXPO_URL = "https://exp.host/--/api/v2/push/send"
-FCM_SECRET_NAME = os.environ.get("FCM_SECRET_NAME", "blucheck/fcm")
+# Derive from RESOURCE_PREFIX (set on every task) so a non-default prefix still resolves the right
+# secret ("${prefix}/fcm"), matching how the worker resolves the RunPod secret. An explicit
+# FCM_SECRET_NAME still overrides.
+FCM_SECRET_NAME = os.environ.get("FCM_SECRET_NAME") or f"{os.environ.get('RESOURCE_PREFIX', 'blucheck')}/fcm"
 AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 
 _secrets = boto3.client("secretsmanager", region_name=AWS_REGION)

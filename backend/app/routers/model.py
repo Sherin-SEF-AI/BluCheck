@@ -290,7 +290,10 @@ def set_thresholds(
     body: ModelThresholdsRequest, admin: User = Depends(require_admin), db: Session = Depends(get_db)
 ):
     mv = ensure_active_model_version(db)
-    mv.thresholds = body.thresholds
+    # Merge at the top level: the thresholds blob also holds operational keys owned by other
+    # endpoints (cadence_hours, appeal_auto_resolve). A wholesale replace silently reset the
+    # inspection cadence and re-enabled appeal auto-resolve. Setting bands must leave those alone.
+    mv.thresholds = {**(mv.thresholds or {}), **body.thresholds}
     audit.record(
         db,
         actor_id=admin.id,

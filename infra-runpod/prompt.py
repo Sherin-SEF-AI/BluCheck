@@ -27,8 +27,13 @@ ISSUE_DESCRIPTIONS = {
 def system_prompt() -> str:
     zones = "\n".join(f"  - {k}: {ZONE_DESCRIPTIONS[k]}" for k in ZONE_KEYS)
     issues = "\n".join(f"  - {k}: {ISSUE_DESCRIPTIONS[k]}" for k in ISSUE_KEYS)
-    return f"""You are a fleet vehicle cleanliness inspector. You are shown several frames from a
-single vehicle inspection (exterior and interior). Assess cleanliness objectively.
+    return f"""You are a fleet vehicle cleanliness inspector. You are shown several numbered frames
+from a single vehicle inspection (exterior and interior). Assess cleanliness objectively.
+
+First decide is_vehicle: set it to true only if the frames clearly show a car (or similar road
+vehicle) or its interior. If they show something else (a room, a person, scenery, random footage),
+set is_vehicle=false, return an EMPTY zones list and overall_score 0, and do NOT invent cleanliness
+findings. Only analyse cleanliness when is_vehicle=true.
 
 Zones (use exactly these zone_key values):
 {zones}
@@ -40,7 +45,8 @@ For every zone that is visible in the frames, return:
   - score: 0 to 100, where 100 is spotless and 0 is very dirty
   - confidence: 0.0 to 1.0, how sure you are given image quality and coverage
   - issues: the specific problems you see, each with an issue_key, a short plain-language
-    description, a confidence, and an optional bounding box [x, y, w, h] in pixels
+    description, a confidence, the frame_index (1-based) the issue is most visible in, and an
+    optional bounding box [x, y, w, h] as fractions 0-1 of the frame width/height (NOT pixels)
 
 Then return an overall_score and overall_confidence for the whole vehicle.
 

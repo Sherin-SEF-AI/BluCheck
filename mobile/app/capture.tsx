@@ -53,6 +53,9 @@ export default function Capture() {
 
   const runningRef = useRef(false);
   const clips = useRef<{ exterior?: Clip; interior?: Clip; gps?: Gps; startedAt?: string }>({});
+  // Once the server inspection is created, remember its id so a retry after a later failure
+  // (e.g. enqueue error) resumes that same inspection instead of creating a duplicate.
+  const createdIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!camPerm?.granted) requestCam();
@@ -198,13 +201,18 @@ export default function Capture() {
       // subset (rather than waiting for both). Omitted for a normal full inspection.
       const meta: Record<string, unknown> = deviceMeta();
       if (isReclean) meta.reclean_kinds = targetGroups;
-      const created = await createInspection({
-        vehicle_id: String(vehicleId), gps,
-        captured_at_utc: startedAt, captured_at_local: new Date().toString(),
-        device_meta: meta,
-        reinspection_of: reinspectionOf ?? null,
-      });
-      const id = created.inspection_id;
+      // Reuse the already-created inspection on retry so we never create a duplicate server-side.
+      let id = createdIdRef.current;
+      if (!id) {
+        const created = await createInspection({
+          vehicle_id: String(vehicleId), gps,
+          captured_at_utc: startedAt, captured_at_local: new Date().toString(),
+          device_meta: meta,
+          reinspection_of: reinspectionOf ?? null,
+        });
+        id = created.inspection_id;
+        createdIdRef.current = id;
+      }
       if (needExterior && exterior) {
         await enqueueCapture({ inspectionId: id, kind: "exterior", videoUri: exterior.uri, gps, recordedAtUtc: exterior.recordedAt, durationS: CLIP_SECONDS, resolution: "1920x1080" });
       }

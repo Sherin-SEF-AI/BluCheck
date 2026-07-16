@@ -17,7 +17,7 @@ resource "aws_sqs_queue" "extraction" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.extraction_dlq.arn
-    maxReceiveCount     = var.raw_retention_days > 0 ? 5 : 5
+    maxReceiveCount     = 5
   })
 
   tags = { Name = "${local.prefix}-extraction" }
